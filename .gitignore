@@ -1,3 +1,5 @@
 # ignore runtime outputs and venv
 backend/jobs/
 backend/MBvenv/
+backend/.env
+backend/__pycache__/
