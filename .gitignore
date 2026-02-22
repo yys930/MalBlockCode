@@ -2,4 +2,4 @@
 backend/jobs/
 backend/MBvenv/
 backend/.env
-backend/__pycache__/
+backend/agent/__pycache__/
