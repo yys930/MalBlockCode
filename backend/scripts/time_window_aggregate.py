@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-time_window_aggregate.py (ALL + SELECTED)
+time_window_aggregate.py (ALL + SELECTED) - Final
 
 输入：
 - <job_dir>/alerts_filtered.jsonl
@@ -11,8 +11,9 @@ time_window_aggregate.py (ALL + SELECTED)
 - <job_dir>/llm_inputs_summary.json      # 汇总（total_groups/selected_groups 等）
 
 说明：
-- “全部窗口”指所有 (src_ip, window_id) 分组后的聚合结果；
-- “筛选机制”只作用于 selected 输出，便于后续只给 LLM 喂 TopK。
+- “全部窗口”= 所有 (src_ip, window_id) 分组后的聚合结果（不做 topk 截断）
+- “筛选机制”只作用于 selected 输出
+- topk=0 表示 selected 不截断（输出全部满足 min-hits 的窗口）
 """
 
 import argparse
@@ -24,6 +25,7 @@ from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
 
+# ---------- helpers ----------
 def parse_ts(ts: str) -> datetime:
     """
     解析 Suricata timestamp，例如：
@@ -38,16 +40,30 @@ def parse_ts(ts: str) -> datetime:
 
 
 def dt_to_epoch(dt: datetime) -> int:
+    """datetime -> epoch seconds"""
     return int(dt.timestamp())
 
 
 def epoch_to_iso(epoch_s: int, tz: Optional[timezone] = None) -> str:
+    """epoch seconds -> ISO string（默认 UTC 展示）"""
     dt = datetime.fromtimestamp(epoch_s, tz=tz or timezone.utc)
     return dt.isoformat()
 
 
+def to_int(x) -> Optional[int]:
+    """把 x 尝试转成 int（兼容 json 中的 '88'/'3' 字符串）"""
+    if x is None:
+        return None
+    try:
+        return int(x)
+    except Exception:
+        return None
+
+
+# ---------- aggregation ----------
 @dataclass
 class WindowAgg:
+    """一个窗口聚合单元：src_ip 在一个时间窗内的行为摘要"""
     src_ip: str
     window_id: int
     window_start: int
@@ -71,10 +87,11 @@ class WindowAgg:
         self.proto_counter = Counter()
 
     def add(self, rec: Dict[str, Any], ts_epoch: int):
+        """把一条 alert 记录汇入当前窗口统计"""
         self.hits += 1
 
-        sev = rec.get("severity")
-        if isinstance(sev, int):
+        sev = to_int(rec.get("severity"))
+        if sev is not None:
             self.severity_min = min(self.severity_min, sev)
 
         sig = rec.get("signature") or "UNKNOWN_SIGNATURE"
@@ -83,8 +100,8 @@ class WindowAgg:
         dip = rec.get("dest_ip") or "UNKNOWN_DEST"
         self.dest_ip_counter[dip] += 1
 
-        dport = rec.get("dest_port")
-        if isinstance(dport, int):
+        dport = to_int(rec.get("dest_port"))
+        if dport is not None:
             self.dest_ports.add(dport)
 
         proto = rec.get("proto") or "UNKNOWN_PROTO"
@@ -94,12 +111,14 @@ class WindowAgg:
         self.last_ts_epoch = max(self.last_ts_epoch, ts_epoch)
 
     def to_llm_input(self, top_sig_n: int, top_dest_ip_n: int) -> Dict[str, Any]:
+        """输出一条可直接喂给 LLM 的聚合 JSON"""
         top_sigs = [{"signature": s, "count": c} for s, c in self.sig_counter.most_common(top_sig_n)]
         top_dips = [{"dest_ip": ip, "count": c} for ip, c in self.dest_ip_counter.most_common(top_dest_ip_n)]
         protos = [{"proto": p, "count": c} for p, c in self.proto_counter.most_common(5)]
 
         return {
             "src_ip": self.src_ip,
+
             "window_sec": self.window_end - self.window_start,
             "window_start_epoch": self.window_start,
             "window_end_epoch": self.window_end,
@@ -120,19 +139,22 @@ class WindowAgg:
 
 
 def score_for_rank(agg: WindowAgg) -> Tuple[int, int]:
-    """排序：hits 越多越靠前；severity_min 越小越靠前"""
+    """selected 排序：hits 越多越靠前；severity_min 越小越靠前"""
     sev = agg.severity_min if agg.severity_min != 999 else 99
     return (agg.hits, -sev)
 
 
+# ---------- main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Aggregate alerts_filtered.jsonl by time windows.")
+    ap = argparse.ArgumentParser(description="Aggregate alerts_filtered.jsonl by time windows (ALL + SELECTED).")
     ap.add_argument("--job-dir", required=True, help="Job directory containing alerts_filtered.jsonl")
     ap.add_argument("--window-sec", type=int, default=60, help="Window size in seconds (default: 60)")
 
     # 筛选机制（只影响 selected 输出）
-    ap.add_argument("--min-hits", type=int, default=3, help="selected: keep windows with hits >= min-hits (default: 3)")
-    ap.add_argument("--topk", type=int, default=200, help="selected: keep top K windows by score; 0=keep all (default: 200)")
+    ap.add_argument("--min-hits", type=int, default=3,
+                    help="selected: keep windows with hits >= min-hits (default: 3)")
+    ap.add_argument("--topk", type=int, default=200,
+                    help="selected: keep top K windows by score; 0=keep all (default: 200)")
 
     # 每条聚合记录里保留的 TopN 字段
     ap.add_argument("--top-sig-n", type=int, default=5, help="Top N signatures per record (default: 5)")
@@ -179,16 +201,17 @@ def main():
 
     all_aggs = list(groups.values())
 
-    # 2) 写 ALL 输出（不做 topk 截断）
+    # 2) 写 ALL 输出（排序保证可复现）
+    all_aggs_sorted = sorted(all_aggs, key=lambda a: (a.window_start, a.src_ip))
     out_all = job_dir / "llm_inputs_all.jsonl"
     with out_all.open("w", encoding="utf-8") as out:
-        for a in all_aggs:
+        for a in all_aggs_sorted:
             out.write(json.dumps(a.to_llm_input(args.top_sig_n, args.top_dest_ip_n), ensure_ascii=False) + "\n")
 
     # 3) 生成 SELECTED：保留筛选机制
     selected = [a for a in all_aggs if a.hits >= args.min_hits]
     selected.sort(key=score_for_rank, reverse=True)
-    if args.topk and args.topk > 0:
+    if args.topk is not None and args.topk > 0:
         selected = selected[: args.topk]  # topk>0 才截断；topk=0 表示保留全部
 
     out_sel = job_dir / "llm_inputs_selected.jsonl"
@@ -203,10 +226,12 @@ def main():
         "window_sec": window_sec,
         "total_groups": len(all_aggs),
         "all_output": str(out_all),
+
         "selected_groups": len(selected),
         "selected_output": str(out_sel),
         "min_hits": args.min_hits,
         "topk": args.topk,
+
         "top_preview_selected": [
             {
                 "src_ip": a.src_ip,
@@ -218,7 +243,10 @@ def main():
             for a in selected[:10]
         ],
     }
-    (job_dir / "llm_inputs_summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    (job_dir / "llm_inputs_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8"
+    )
 
     print("[*] DONE")
     print("[*] total_groups    =", len(all_aggs))
