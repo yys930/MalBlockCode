@@ -1,0 +1,3 @@
+# ignore runtime outputs and venv
+backend/jobs/
+backend/MBvenv/
