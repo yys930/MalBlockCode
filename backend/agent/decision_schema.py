@@ -48,6 +48,12 @@ def validate_decision(dec: Dict[str, Any], constraints: Dict[str, Any]) -> Tuple
     if action == "block" and ip in never_block:
         return False, f"attempt to block never_block_ips: {ip}"
 
+    labels = dec.get("labels", [])
+    if not isinstance(labels, list) or len(labels) == 0:
+        return False, "labels must be non-empty list"
+    if any(not isinstance(item, str) or not item.strip() for item in labels):
+        return False, "labels must contain non-empty strings"
+
     # evidence fields
     evidence = dec.get("evidence")
     if not isinstance(evidence, dict):
@@ -61,6 +67,8 @@ def validate_decision(dec: Dict[str, Any], constraints: Dict[str, Any]) -> Tuple
     reasons = dec.get("reasons", [])
     if not isinstance(reasons, list) or len(reasons) == 0 or len(reasons) > 3:
         return False, "reasons must be list (1~3 items)"
+    if any(not isinstance(item, str) or not item.strip() for item in reasons):
+        return False, "reasons must contain non-empty strings"
 
     # confidence/risk_score basic
     conf = dec.get("confidence", 0.0)
@@ -78,5 +86,9 @@ def validate_decision(dec: Dict[str, Any], constraints: Dict[str, Any]) -> Tuple
         return False, "risk_score must be int"
     if score < 0 or score > 100:
         return False, "risk_score out of range"
+
+    tool_result = dec.get("tool_result")
+    if tool_result is not None and not isinstance(tool_result, dict):
+        return False, "tool_result must be object when provided"
 
     return True, None

@@ -2,23 +2,12 @@
 import ipaddress
 from typing import Any, Dict, List, Tuple
 
-# 1) 噪声与强可疑关键词：你可随时扩展
-NOISE_SIGNATURE_KEYWORDS = [
-    "invalid checksum",
-    "invalid ack",
-    "unable to match response to request",
-    "request header invalid",
-]
-
-STRONG_SUSPICIOUS_KEYWORDS = [
-    "likely hostile",
-    "often malware related",
-]
-
-MEDIUM_SUSPICIOUS_KEYWORDS = [
-    "dns query for .to",
-    "observed dns query to .biz",
-]
+from agent.policy import (
+    NOISE_SIGNATURE_KEYWORDS,
+    STRONG_SUSPICIOUS_KEYWORDS,
+    MEDIUM_SUSPICIOUS_KEYWORDS,
+    get_constraints,
+)
 
 def is_private_ip(ip: str) -> bool:
     try:
@@ -64,37 +53,21 @@ def signature_stats(top_signatures: List[Dict[str, Any]]) -> Tuple[int, int, flo
     noise_ratio = (noise / total) if total > 0 else 0.0
     return total, noise, noise_ratio, has_strong, has_medium, has_noise
 
-def get_constraints() -> Dict[str, Any]:
-    """
-    constraints：系统安全策略（不是从数据“获得”，是你制定的规则）
-    """
-    return {
-        "allowed_actions": ["block", "observe", "ignore", "review"],
-        "default_action_if_uncertain": "review",
-        "require_json_only": True,
-        "max_ttl_sec": 86400,               # 24h
-        "min_ttl_sec_if_block": 300,         # 5min
-        "prefer_not_block_on_noise_only": True,
-        # 关键基础设施/白名单：你可继续加
-        "never_block_ips": [
-            "192.168.10.3",   # 内网 DNS（示例：来自你的数据）
-            "192.168.71.1",   # VMware 网关（示例）
-            "127.0.0.1",
-        ],
-        # 可选：如果你不希望自动封内网主机，可设 True
-        "never_block_private_src": False,
-        # 需要 LLM 必须引用的证据字段（用于可解释性）
-        "required_evidence_fields": [
-            "src_ip",
-            "window_start_iso",
-            "window_end_iso",
-            "hits",
-            "severity_min",
-            "top_signatures",
-            "dest_ports",
-            "top_dest_ips",
-        ],
-    }
+
+def classify_attack_family(top_signatures: List[Dict[str, Any]]) -> str:
+    joined = " | ".join(str(item.get("signature", "")).lower() for item in top_signatures or [])
+
+    if any(k in joined for k in ["scan", "portscan", "port scan"]):
+        return "portscan"
+    if any(k in joined for k in ["dos", "ddos", "flood"]):
+        return "dos"
+    if any(k in joined for k in ["bot", "trojan", "malware", "c2", "command and control"]):
+        return "botnet"
+    if any(k in joined for k in ["sql injection", "xss", "web attack", "http exploit"]):
+        return "web-attack"
+    if any(k in joined for k in ["brute force", "ssh", "ftp login"]):
+        return "brute-force"
+    return "unknown"
 
 def build_hints(window: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -107,8 +80,14 @@ def build_hints(window: Dict[str, Any]) -> Dict[str, Any]:
 
     total_sig_hits, noise_hits, noise_ratio, has_strong, has_medium, has_noise = signature_stats(top_sigs)
 
-    # 简单 burst 估计：你目前 first/last 是 ISO，无 epoch，先不算（后续可从 eve.json enrich）
+    first_epoch = window.get("window_start_epoch")
+    last_epoch = window.get("window_end_epoch")
     burst_seconds = None
+    if isinstance(first_epoch, int) and isinstance(last_epoch, int) and last_epoch >= first_epoch:
+        burst_seconds = last_epoch - first_epoch
+
+    attack_family = classify_attack_family(top_sigs)
+    top_signature = top_sigs[0].get("signature") if top_sigs else None
 
     return {
         "src_ip_valid": is_valid_ip(src_ip),
@@ -120,13 +99,16 @@ def build_hints(window: Dict[str, Any]) -> Dict[str, Any]:
         "has_noise_keyword": has_noise,
         "has_strong_suspicious": has_strong,
         "has_medium_suspicious": has_medium,
+        "attack_family": attack_family,
         "hits": window.get("hits"),
         "severity_min": window.get("severity_min"),
+        "top_signature": top_signature,
+        "signature_count": len(top_sigs),
         "top_dest_ip": (top_dest_ips[0].get("dest_ip") if top_dest_ips else None),
         "burst_seconds": burst_seconds,
     }
 
-def build_message(window: Dict[str, Any]) -> Dict[str, Any]:
+def build_message(window: Dict[str, Any], retrieved_evidence: List[Dict[str, Any]] | None = None) -> Dict[str, Any]:
     """
     message = {task, constraints, hints, window}
     你会把这个 JSON 作为 user message content 给 LLM
@@ -136,4 +118,5 @@ def build_message(window: Dict[str, Any]) -> Dict[str, Any]:
         "constraints": get_constraints(),
         "hints": build_hints(window),
         "window": window,
+        "retrieved_evidence": retrieved_evidence or [],
     }

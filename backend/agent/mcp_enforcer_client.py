@@ -1,5 +1,6 @@
 # backend/agent/mcp_enforcer_client.py
 import asyncio
+import json
 import threading
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -92,7 +93,7 @@ class MCPEnforcerClient:
         await self._connect()
         assert self._session is not None
         res = await self._session.call_tool(name, arguments=arguments)
-        return res.model_dump()
+        return self._normalize_tool_response(res.model_dump())
 
     async def _aclose(self) -> None:
         if self._session:
@@ -117,3 +118,35 @@ class MCPEnforcerClient:
 
     def list_blocked(self) -> Dict[str, Any]:
         return self.call_tool("list_blocked", {})
+
+    @staticmethod
+    def _normalize_tool_response(raw: Dict[str, Any]) -> Dict[str, Any]:
+        if raw.get("isError") is True:
+            return {"ok": False, "mcp_raw": raw, "error": "mcp tool call returned isError=true"}
+
+        content = raw.get("content")
+        if not isinstance(content, list):
+            return raw
+
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+
+            text = item.get("text")
+            if not isinstance(text, str):
+                continue
+
+            text = text.strip()
+            if not text:
+                continue
+
+            try:
+                parsed = json.loads(text)
+            except json.JSONDecodeError:
+                continue
+
+            if isinstance(parsed, dict):
+                parsed.setdefault("mcp_raw", raw)
+                return parsed
+
+        return raw
