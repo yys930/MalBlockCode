@@ -113,6 +113,12 @@ class MCPEnforcerClient:
     def block_ip(self, ip: str, ttl_sec: int, reason: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         return self.call_tool("block_ip", {"ip": ip, "ttl_sec": int(ttl_sec), "reason": reason, "meta": meta})
 
+    def rate_limit_ip(self, ip: str, ttl_sec: int, reason: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        return self.call_tool("rate_limit_ip", {"ip": ip, "ttl_sec": int(ttl_sec), "reason": reason, "meta": meta})
+
+    def watch_ip(self, ip: str, ttl_sec: int, reason: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+        return self.call_tool("watch_ip", {"ip": ip, "ttl_sec": int(ttl_sec), "reason": reason, "meta": meta})
+
     def unblock_ip(self, ip: str, reason: str, meta: Dict[str, Any]) -> Dict[str, Any]:
         return self.call_tool("unblock_ip", {"ip": ip, "reason": reason, "meta": meta})
 

@@ -1,5 +1,38 @@
-# ignore runtime outputs and venv
-backend/jobs/
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
 backend/MBvenv/
+
+# Local environment files
+.env
+.env.*
 backend/.env
-backend/agent/__pycache__/
+
+# Runtime outputs and experiment artifacts
+backend/jobs/
+tmp/
+
+# Local RAG/runtime state
+backend/rag/chroma_db/
+backend/rag/*.sqlite3
+backend/rag/decision_history.jsonl
+backend/rag/enforcer_audit.jsonl
+
+# Local datasets and generated data files
+backend/datasets/
+*.csv
+*.parquet
+
+# Logs
+*.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db

@@ -6,10 +6,13 @@ time_window_aggregate.py (ALL + SELECTED) - CLI wrapper
 import argparse
 import sys
 from pathlib import Path
+from dotenv import load_dotenv
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 if str(BACKEND_ROOT) not in sys.path:
     sys.path.insert(0, str(BACKEND_ROOT))
+
+load_dotenv()
 
 from pipeline.window_aggregate import aggregate_time_windows
 
@@ -22,8 +25,8 @@ def main():
     # 筛选机制（只影响 selected 输出）
     ap.add_argument("--min-hits", type=int, default=3,
                     help="selected: keep windows with hits >= min-hits (default: 3)")
-    ap.add_argument("--topk", type=int, default=200,
-                    help="selected: keep top K windows by score; 0=keep all (default: 200)")
+    ap.add_argument("--topk", type=int, default=20,
+                    help="selected: keep top K windows by score; 0=keep all (default: 20)")
 
     # 每条聚合记录里保留的 TopN 字段
     ap.add_argument("--top-sig-n", type=int, default=5, help="Top N signatures per record (default: 5)")

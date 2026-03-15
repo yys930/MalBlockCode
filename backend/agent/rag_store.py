@@ -1,74 +1,70 @@
 import json
-import math
 import os
-from typing import Any, Dict, Iterable, List, Tuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
+from path_utils import BACKEND_ROOT, resolve_project_path
 from agent.window_reader import iter_jsonl
 
 
-def _safe_set(items: Iterable[Any]) -> set[str]:
-    return {str(item) for item in items if item is not None}
+@dataclass
+class VectorRAGConfig:
+    db_dir: str
+    archive_path: str
+    collection_name: str = "historical_decision_cases"
+    embedding_model: str = "BAAI/bge-m3"
+    embedding_api_key: str = ""
+    embedding_base_url: str = "https://api.openai.com/v1"
+    min_similarity: float = 0.45
+    include_pending_feedback: bool = False
 
 
-def _extract_top_signatures(window: Dict[str, Any]) -> List[str]:
-    return [str(item.get("signature")) for item in window.get("top_signatures", []) if item.get("signature")]
+def default_rag_config() -> VectorRAGConfig:
+    rag_root = BACKEND_ROOT / "rag"
+    return VectorRAGConfig(
+        db_dir=str(resolve_project_path(os.environ.get("RAG_DB_DIR", str(rag_root / "chroma_db")))),
+        archive_path=str(resolve_project_path(os.environ.get("RAG_ARCHIVE_PATH", str(rag_root / "decision_history.jsonl")))),
+        collection_name=os.environ.get("RAG_COLLECTION", "historical_decision_cases"),
+        embedding_model=os.environ.get("RAG_EMBED_MODEL", "BAAI/bge-m3"),
+        embedding_api_key=(
+            os.environ.get("RAG_EMBED_API_KEY", "").strip()
+            or os.environ.get("SILICONFLOW_API_KEY", "").strip()
+            or os.environ.get("OPENAI_API_KEY", "").strip()
+        ),
+        embedding_base_url=os.environ.get(
+            "RAG_EMBED_BASE_URL",
+            os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
+        ),
+        min_similarity=float(os.environ.get("RAG_MIN_SIMILARITY", "0.45")),
+        include_pending_feedback=os.environ.get("RAG_INCLUDE_PENDING_FEEDBACK", "0") == "1",
+    )
 
 
-def _extract_top_dest_ips(window: Dict[str, Any]) -> List[str]:
-    return [str(item.get("dest_ip")) for item in window.get("top_dest_ips", []) if item.get("dest_ip")]
+def _require_chromadb():
+    try:
+        import chromadb  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "chromadb is not installed. Install it in the active environment, for example: "
+            "`pip install chromadb`"
+        ) from exc
+    return chromadb
 
 
-def _jaccard(a: set[str], b: set[str]) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
+def _require_openai():
+    try:
+        from openai import OpenAI  # type: ignore
+    except ModuleNotFoundError as exc:
+        raise RuntimeError(
+            "openai is not installed. Install it in the active environment, for example: "
+            "`pip install openai`"
+        ) from exc
+    return OpenAI
 
 
-def _score_similarity(message: Dict[str, Any], case: Dict[str, Any]) -> float:
-    hints = message.get("hints", {})
-    window = message.get("window", {})
-    profile = case.get("incident_profile", {})
-    case_hints = profile.get("hints", {})
-    case_window = profile.get("window", {})
-    case_strategy = case.get("historical_strategy", {})
-    feedback = case.get("feedback", {})
-
-    score = 0.0
-
-    if hints.get("attack_family") and hints.get("attack_family") == case_hints.get("attack_family"):
-        score += 4.0
-
-    if hints.get("top_signature") and hints.get("top_signature") == case_hints.get("top_signature"):
-        score += 3.0
-
-    sig_score = _jaccard(_safe_set(_extract_top_signatures(window)), _safe_set(_extract_top_signatures(case_window)))
-    score += sig_score * 3.0
-
-    port_score = _jaccard(_safe_set(window.get("dest_ports", [])), _safe_set(case_window.get("dest_ports", [])))
-    score += port_score * 2.0
-
-    dest_ip_score = _jaccard(_safe_set(_extract_top_dest_ips(window)), _safe_set(_extract_top_dest_ips(case_window)))
-    score += dest_ip_score * 1.5
-
-    sev = window.get("severity_min")
-    case_sev = case_window.get("severity_min")
-    if isinstance(sev, int) and isinstance(case_sev, int):
-        score += max(0.0, 1.0 - min(abs(sev - case_sev), 5) / 5.0)
-
-    hits = int(window.get("hits") or 0)
-    case_hits = int(case_window.get("hits") or 0)
-    if hits > 0 and case_hits > 0:
-        log_gap = abs(math.log1p(hits) - math.log1p(case_hits))
-        score += max(0.0, 1.0 - min(log_gap, 3.0) / 3.0)
-
-    if case_strategy.get("action") == "block":
-        score += 0.25
-    if feedback.get("is_effective") is True:
-        score += 0.75
-    if feedback.get("false_positive") is True:
-        score -= 1.0
-
-    return round(score, 4)
+def _ensure_parent(path: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
 
 
 def _build_feedback_stub(decision: Dict[str, Any]) -> Dict[str, Any]:
@@ -90,20 +86,23 @@ def _build_feedback_stub(decision: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def build_rag_case(message: Dict[str, Any], decision: Dict[str, Any], feedback: Dict[str, Any] | None = None) -> Dict[str, Any]:
-    window = message.get("window", {})
+    window = message.get("evidence_window", message.get("window", {}))
     hints = message.get("hints", {})
     meta = message.get("meta", {})
     retrieved = message.get("retrieved_evidence", [])
     feedback = feedback or _build_feedback_stub(decision)
 
     return {
-        "case_version": 2,
+        "case_version": 3,
+        "case_id": meta.get("window_key") or f'{window.get("src_ip")}:{window.get("window_start_epoch")}-{window.get("window_end_epoch")}',
         "window_key": meta.get("window_key"),
         "job_id": meta.get("job_id"),
         "incident_profile": {
             "hints": hints,
             "window": {
                 "src_ip": window.get("src_ip"),
+                "window_start_epoch": window.get("window_start_epoch"),
+                "window_end_epoch": window.get("window_end_epoch"),
                 "window_start_iso": window.get("window_start_iso"),
                 "window_end_iso": window.get("window_end_iso"),
                 "hits": window.get("hits"),
@@ -120,6 +119,7 @@ def build_rag_case(message: Dict[str, Any], decision: Dict[str, Any], feedback: 
             "risk_score": decision.get("risk_score"),
             "labels": decision.get("labels", []),
             "reasons": decision.get("reasons", []),
+            "strategy": decision.get("strategy", {}),
         },
         "execution_result": decision.get("tool_result"),
         "feedback": feedback,
@@ -130,58 +130,279 @@ def build_rag_case(message: Dict[str, Any], decision: Dict[str, Any], feedback: 
     }
 
 
-def load_rag_cases(store_path: str) -> List[Dict[str, Any]]:
-    if not store_path or not os.path.exists(store_path):
-        return []
-    return list(iter_jsonl(store_path))
+def _top_signatures_text(window: Dict[str, Any]) -> str:
+    parts = []
+    for item in window.get("top_signatures", []):
+        sig = item.get("signature")
+        count = item.get("count")
+        if sig:
+            parts.append(f"{sig} ({count})")
+    return ", ".join(parts)
 
 
-def retrieve_evidence(message: Dict[str, Any], store_path: str, top_k: int = 3) -> List[Dict[str, Any]]:
-    ranked: List[Tuple[float, Dict[str, Any]]] = []
-    for case in load_rag_cases(store_path):
-        score = _score_similarity(message, case)
-        if score <= 0:
-            continue
-        ranked.append((score, case))
+def _top_dest_ips_text(window: Dict[str, Any]) -> str:
+    parts = []
+    for item in window.get("top_dest_ips", []):
+        dest_ip = item.get("dest_ip")
+        count = item.get("count")
+        if dest_ip:
+            parts.append(f"{dest_ip} ({count})")
+    return ", ".join(parts)
 
-    ranked.sort(key=lambda item: item[0], reverse=True)
 
-    results: List[Dict[str, Any]] = []
-    for score, case in ranked[:top_k]:
-        profile = case.get("incident_profile", {})
-        strategy = case.get("historical_strategy", {})
-        feedback = case.get("feedback", {})
-        results.append(
-            {
-                "similarity": score,
-                "job_id": case.get("job_id"),
-                "window_key": case.get("window_key"),
-                "incident_profile": profile,
-                "historical_strategy": strategy,
-                "feedback": feedback,
-                "execution_result": case.get("execution_result"),
-                "strategy_summary": {
-                    "action": strategy.get("action"),
-                    "ttl_sec": strategy.get("ttl_sec"),
-                    "reason_summary": strategy.get("reasons", [])[:2],
-                    "status": feedback.get("status"),
-                    "is_effective": feedback.get("is_effective"),
-                    "false_positive": feedback.get("false_positive"),
-                },
-            }
+def _case_to_document(case: Dict[str, Any]) -> str:
+    profile = case.get("incident_profile", {})
+    hints = profile.get("hints", {})
+    window = profile.get("window", {})
+    strategy = case.get("historical_strategy", {})
+    feedback = case.get("feedback", {})
+    strategy_meta = strategy.get("strategy", {})
+
+    return "\n".join(
+        [
+            "Historical malicious traffic mitigation case",
+            f"attack_family: {hints.get('attack_family')}",
+            f"top_signature: {hints.get('top_signature')}",
+            f"hits: {window.get('hits')}",
+            f"severity_min: {window.get('severity_min')}",
+            f"dest_ports: {window.get('dest_ports', [])}",
+            f"top_signatures: {_top_signatures_text(window)}",
+            f"top_dest_ips: {_top_dest_ips_text(window)}",
+            f"historical_action: {strategy.get('action')}",
+            f"historical_ttl_sec: {strategy.get('ttl_sec')}",
+            f"historical_priority: {strategy_meta.get('priority')}",
+            f"historical_duration_tier: {strategy_meta.get('duration_tier')}",
+            f"historical_follow_up: {strategy_meta.get('follow_up')}",
+            f"historical_template_id: {strategy_meta.get('template_id')}",
+            f"historical_escalation_level: {strategy_meta.get('escalation_level')}",
+            f"historical_reasons: {' | '.join(strategy.get('reasons', []))}",
+            f"historical_labels: {strategy.get('labels', [])}",
+            f"feedback_status: {feedback.get('status')}",
+            f"is_effective: {feedback.get('is_effective')}",
+            f"false_positive: {feedback.get('false_positive')}",
+            f"alert_drop_ratio: {feedback.get('alert_drop_ratio')}",
+        ]
+    )
+
+
+def _query_to_text(message: Dict[str, Any]) -> str:
+    hints = message.get("hints", {})
+    window = message.get("evidence_window", message.get("window", {}))
+    return "\n".join(
+        [
+            "Current malicious traffic decision query",
+            f"attack_family: {hints.get('attack_family')}",
+            f"top_signature: {hints.get('top_signature')}",
+            f"hits: {window.get('hits')}",
+            f"severity_min: {window.get('severity_min')}",
+            f"dest_ports: {window.get('dest_ports', [])}",
+            f"top_signatures: {_top_signatures_text(window)}",
+            f"top_dest_ips: {_top_dest_ips_text(window)}",
+            "Task: retrieve historical decision cases that can guide mitigation strategy before current LLM decision.",
+        ]
+    )
+
+
+class VectorRAGStore:
+    def __init__(self, cfg: VectorRAGConfig):
+        self.cfg = cfg
+        self._client = None
+        self._collection = None
+        self._embedding_client = None
+
+    def _embedding_api_enabled(self) -> bool:
+        return bool(self.cfg.embedding_api_key)
+
+    def _get_embedding_client(self):
+        if self._embedding_client is None:
+            if not self._embedding_api_enabled():
+                raise RuntimeError(
+                    "RAG embedding API key is not configured. Set `RAG_EMBED_API_KEY` or reuse "
+                    "`SILICONFLOW_API_KEY` / `OPENAI_API_KEY`."
+                )
+            OpenAI = _require_openai()
+            self._embedding_client = OpenAI(
+                api_key=self.cfg.embedding_api_key,
+                base_url=self.cfg.embedding_base_url,
+            )
+        return self._embedding_client
+
+    def _embed_texts(self, texts: List[str]) -> List[List[float]]:
+        client = self._get_embedding_client()
+        response = client.embeddings.create(model=self.cfg.embedding_model, input=texts)
+        return [item.embedding for item in response.data]
+
+    def _get_collection(self):
+        if self._collection is not None:
+            return self._collection
+
+        chromadb = _require_chromadb()
+        os.makedirs(self.cfg.db_dir, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=self.cfg.db_dir)
+        self._collection = self._client.get_or_create_collection(name=self.cfg.collection_name)
+        return self._collection
+
+    def upsert_case(self, case: Dict[str, Any]) -> None:
+        collection = self._get_collection()
+        case_id = case.get("case_id") or case.get("window_key")
+        if not case_id:
+            raise ValueError("RAG case missing case_id/window_key")
+
+        document = _case_to_document(case)
+        embedding = self._embed_texts([document])[0]
+        metadata = {
+            "case_id": str(case_id),
+            "job_id": str(case.get("job_id") or ""),
+            "window_key": str(case.get("window_key") or ""),
+            "action": str(case.get("historical_strategy", {}).get("action") or ""),
+            "attack_family": str(case.get("incident_profile", {}).get("hints", {}).get("attack_family") or ""),
+            "case_json": json.dumps(case, ensure_ascii=False),
+        }
+        collection.upsert(
+            ids=[str(case_id)],
+            documents=[document],
+            embeddings=[embedding],
+            metadatas=[metadata],
         )
-    return results
+
+    def query(self, message: Dict[str, Any], top_k: int = 3) -> List[Dict[str, Any]]:
+        collection = self._get_collection()
+        query_text = _query_to_text(message)
+        query_embedding = self._embed_texts([query_text])[0]
+        result = collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+            include=["metadatas", "distances"],
+        )
+
+        metadatas = (result.get("metadatas") or [[]])[0]
+        distances = (result.get("distances") or [[]])[0]
+        retrieved: List[Dict[str, Any]] = []
+
+        for idx, meta in enumerate(metadatas):
+            if not isinstance(meta, dict):
+                continue
+            raw_case = meta.get("case_json")
+            if not isinstance(raw_case, str):
+                continue
+            try:
+                case = json.loads(raw_case)
+            except json.JSONDecodeError:
+                continue
+
+            strategy = case.get("historical_strategy", {})
+            feedback = case.get("feedback", {})
+            strategy_meta = strategy.get("strategy", {})
+            if not self.cfg.include_pending_feedback and feedback.get("status") == "pending_evaluation":
+                continue
+            distance = distances[idx] if idx < len(distances) else None
+            similarity = None if distance is None else round(1.0 / (1.0 + float(distance)), 6)
+            if similarity is not None and similarity < self.cfg.min_similarity:
+                continue
+            retrieved.append(
+                {
+                    "similarity": similarity,
+                    "distance": distance,
+                    "job_id": case.get("job_id"),
+                    "window_key": case.get("window_key"),
+                    "incident_profile": {
+                        "hints": {
+                            "attack_family": case.get("incident_profile", {}).get("hints", {}).get("attack_family"),
+                            "top_signature": case.get("incident_profile", {}).get("hints", {}).get("top_signature"),
+                            "hits": case.get("incident_profile", {}).get("hints", {}).get("hits"),
+                            "severity_min": case.get("incident_profile", {}).get("hints", {}).get("severity_min"),
+                            "dominant_proto": case.get("incident_profile", {}).get("hints", {}).get("dominant_proto"),
+                        },
+                        "window": {
+                            "window_start_iso": case.get("incident_profile", {}).get("window", {}).get("window_start_iso"),
+                            "window_end_iso": case.get("incident_profile", {}).get("window", {}).get("window_end_iso"),
+                            "dest_ports": case.get("incident_profile", {}).get("window", {}).get("dest_ports", []),
+                            "top_signatures": case.get("incident_profile", {}).get("window", {}).get("top_signatures", [])[:3],
+                            "top_dest_ips": case.get("incident_profile", {}).get("window", {}).get("top_dest_ips", [])[:2],
+                        },
+                    },
+                    "historical_strategy": {
+                        "action": strategy.get("action"),
+                        "ttl_sec": strategy.get("ttl_sec"),
+                        "confidence": strategy.get("confidence"),
+                        "risk_score": strategy.get("risk_score"),
+                        "labels": strategy.get("labels", [])[:4],
+                        "reasons": strategy.get("reasons", [])[:2],
+                        "strategy": {
+                            "block_scope": strategy_meta.get("block_scope"),
+                            "duration_tier": strategy_meta.get("duration_tier"),
+                            "priority": strategy_meta.get("priority"),
+                            "follow_up": strategy_meta.get("follow_up"),
+                            "template_id": strategy_meta.get("template_id"),
+                            "escalation_level": strategy_meta.get("escalation_level"),
+                        },
+                    },
+                    "feedback": feedback,
+                    "execution_result": {
+                        "ok": (case.get("execution_result") or {}).get("ok"),
+                        "dry_run": (case.get("execution_result") or {}).get("dry_run"),
+                        "ip": (case.get("execution_result") or {}).get("ip"),
+                        "ttl_sec": (case.get("execution_result") or {}).get("ttl_sec"),
+                    },
+                    "strategy_summary": {
+                        "action": strategy.get("action"),
+                        "ttl_sec": strategy.get("ttl_sec"),
+                        "priority": strategy_meta.get("priority"),
+                        "duration_tier": strategy_meta.get("duration_tier"),
+                        "follow_up": strategy_meta.get("follow_up"),
+                        "template_id": strategy_meta.get("template_id"),
+                        "escalation_level": strategy_meta.get("escalation_level"),
+                        "reason_summary": strategy.get("reasons", [])[:2],
+                        "status": feedback.get("status"),
+                        "is_effective": feedback.get("is_effective"),
+                        "false_positive": feedback.get("false_positive"),
+                    },
+                }
+            )
+        return retrieved
+
+
+def load_rag_cases(archive_path: str) -> List[Dict[str, Any]]:
+    if not archive_path or not os.path.exists(archive_path):
+        return []
+    return list(iter_jsonl(archive_path))
+
+
+def resolve_rag_config(config_or_path: Optional[Any] = None) -> VectorRAGConfig:
+    if isinstance(config_or_path, VectorRAGConfig):
+        config_or_path.db_dir = str(resolve_project_path(config_or_path.db_dir))
+        config_or_path.archive_path = str(resolve_project_path(config_or_path.archive_path))
+        return config_or_path
+
+    cfg = default_rag_config()
+    if isinstance(config_or_path, str) and config_or_path:
+        if config_or_path.endswith(".jsonl"):
+            cfg.archive_path = str(resolve_project_path(config_or_path))
+        else:
+            cfg.db_dir = str(resolve_project_path(config_or_path))
+    return cfg
+
+
+def retrieve_evidence(message: Dict[str, Any], config_or_path: Optional[Any] = None, top_k: int = 3) -> List[Dict[str, Any]]:
+    cfg = resolve_rag_config(config_or_path)
+    if not os.path.exists(cfg.db_dir):
+        return []
+    store = VectorRAGStore(cfg)
+    return store.query(message, top_k=top_k)
 
 
 def append_rag_case(
-    store_path: str,
+    config_or_path: Optional[Any],
     message: Dict[str, Any],
     decision: Dict[str, Any],
     feedback: Dict[str, Any] | None = None,
 ) -> None:
-    if not store_path:
-        return
-    os.makedirs(os.path.dirname(store_path), exist_ok=True)
+    cfg = resolve_rag_config(config_or_path)
     record = build_rag_case(message, decision, feedback=feedback)
-    with open(store_path, "a", encoding="utf-8") as f:
+
+    _ensure_parent(cfg.archive_path)
+    with open(cfg.archive_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    store = VectorRAGStore(cfg)
+    store.upsert_case(record)

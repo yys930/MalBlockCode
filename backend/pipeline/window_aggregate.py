@@ -20,6 +20,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, Any, Tuple, List, Optional
 
+from path_utils import resolve_project_path
+
 
 # ---------- helpers ----------
 
@@ -71,8 +73,9 @@ class WindowAgg:
     severity_min: int = 999
 
     sig_counter: Counter = None
+    category_counter: Counter = None
     dest_ip_counter: Counter = None
-    dest_ports: set = None
+    dest_port_counter: Counter = None
     proto_counter: Counter = None
 
     first_ts_epoch: int = 2**31 - 1
@@ -80,8 +83,9 @@ class WindowAgg:
 
     def __post_init__(self):
         self.sig_counter = Counter()
+        self.category_counter = Counter()
         self.dest_ip_counter = Counter()
-        self.dest_ports = set()
+        self.dest_port_counter = Counter()
         self.proto_counter = Counter()
 
     def add(self, rec: Dict[str, Any], ts_epoch: int):
@@ -95,12 +99,15 @@ class WindowAgg:
         sig = rec.get("signature") or "UNKNOWN_SIGNATURE"
         self.sig_counter[sig] += 1
 
+        category = rec.get("category") or "UNKNOWN_CATEGORY"
+        self.category_counter[category] += 1
+
         dip = rec.get("dest_ip") or "UNKNOWN_DEST"
         self.dest_ip_counter[dip] += 1
 
         dport = to_int(rec.get("dest_port"))
         if dport is not None:
-            self.dest_ports.add(dport)
+            self.dest_port_counter[dport] += 1
 
         proto = rec.get("proto") or "UNKNOWN_PROTO"
         self.proto_counter[proto] += 1
@@ -112,7 +119,16 @@ class WindowAgg:
         """输出一条可直接喂给 LLM 的聚合 JSON"""
         top_sigs = [{"signature": s, "count": c} for s, c in self.sig_counter.most_common(top_sig_n)]
         top_dips = [{"dest_ip": ip, "count": c} for ip, c in self.dest_ip_counter.most_common(top_dest_ip_n)]
+        top_categories = [{"category": c, "count": n} for c, n in self.category_counter.most_common(3)]
+        top_ports = [{"dest_port": p, "count": c} for p, c in self.dest_port_counter.most_common(5)]
         protos = [{"proto": p, "count": c} for p, c in self.proto_counter.most_common(5)]
+        burst_duration_sec = (
+            max(0, self.last_ts_epoch - self.first_ts_epoch)
+            if self.first_ts_epoch < 2**31 - 1 and self.last_ts_epoch
+            else None
+        )
+        alert_density_per_sec = round(self.hits / max(1, burst_duration_sec or self.window_end - self.window_start), 4)
+        dominant_proto = protos[0]["proto"] if protos else None
 
         return {
             "src_ip": self.src_ip,
@@ -125,9 +141,17 @@ class WindowAgg:
 
             "hits": self.hits,
             "severity_min": None if self.severity_min == 999 else self.severity_min,
+            "alert_density_per_sec": alert_density_per_sec,
+            "burst_duration_sec": burst_duration_sec,
+            "unique_dest_ip_count": len(self.dest_ip_counter),
+            "unique_dest_port_count": len(self.dest_port_counter),
+            "signature_diversity": len(self.sig_counter),
+            "dominant_proto": dominant_proto,
 
             "top_signatures": top_sigs,
-            "dest_ports": sorted(self.dest_ports),
+            "top_categories": top_categories,
+            "dest_ports": sorted(self.dest_port_counter.keys()),
+            "top_dest_port_counts": top_ports,
             "top_dest_ips": top_dips,
             "proto_top": protos,
 
@@ -136,10 +160,11 @@ class WindowAgg:
         }
 
 
-def score_for_rank(agg: WindowAgg) -> Tuple[int, int]:
-    """selected 排序：hits 越多越靠前；severity_min 越小越靠前"""
+def score_for_rank(agg: WindowAgg) -> Tuple[int, int, int, int]:
+    """selected 排序：hits 越多越靠前；severity_min 越小越靠前；目标和签名越集中越优先"""
     sev = agg.severity_min if agg.severity_min != 999 else 99
-    return (agg.hits, -sev)
+    burst = max(0, agg.last_ts_epoch - agg.first_ts_epoch) if agg.last_ts_epoch and agg.first_ts_epoch < 2**31 - 1 else 0
+    return (agg.hits, -sev, -len(agg.dest_ip_counter), -burst)
 
 
 def aggregate_time_windows(
@@ -150,7 +175,7 @@ def aggregate_time_windows(
     top_sig_n: int = 5,
     top_dest_ip_n: int = 3,
 ) -> Dict[str, Any]:
-    job_dir = Path(job_dir).expanduser().resolve()
+    job_dir = resolve_project_path(job_dir)
     inp = job_dir / "alerts_filtered.jsonl"
     if not inp.exists():
         raise SystemExit(f"[!] not found: {inp}")
