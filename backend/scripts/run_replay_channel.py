@@ -9,7 +9,7 @@ if str(BACKEND_ROOT) not in sys.path:
 
 load_dotenv()
 
-from pipeline.channel_runner import run_replay_channel
+from pipeline.channel_runner import DEFAULT_SURICATA_READY_TIMEOUT_SEC, run_replay_channel
 
 
 def main() -> None:
@@ -23,7 +23,12 @@ def main() -> None:
     parser.add_argument("--replay-netns", default="", help="Optional network namespace used for tcpreplay")
     parser.add_argument("--tcpreplay-extra-arg", action="append", default=[], help="Extra arg passed through to tcpreplay")
     parser.add_argument("--capture-wait-sec", type=int, default=2)
-    parser.add_argument("--suricata-ready-timeout-sec", type=int, default=180, help="How long to wait for Suricata live engine startup")
+    parser.add_argument(
+        "--suricata-ready-timeout-sec",
+        type=int,
+        default=DEFAULT_SURICATA_READY_TIMEOUT_SEC,
+        help="How long to wait for Suricata live engine startup",
+    )
     parser.add_argument("--window-sec", type=int, default=60)
     parser.add_argument("--min-hits", type=int, default=3)
     parser.add_argument("--topk", type=int, default=20)

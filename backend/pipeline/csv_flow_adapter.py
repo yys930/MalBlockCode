@@ -215,15 +215,22 @@ class CSVFlowBuildResult:
     seed: int
 
 
-def _iter_jsonl(path: Path) -> Iterable[Dict[str, Any]]:
-    with path.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                yield json.loads(line)
+@dataclass
+class CSVWindowCandidate:
+    offset: int
+    label: str
+    label_is_malicious: bool
+    severity_min: int
+    flow_packets_per_s: float
 
 
-def _window_priority_key(item: Dict[str, Any]) -> tuple[Any, ...]:
+def _window_priority_key(item: Dict[str, Any] | CSVWindowCandidate) -> tuple[Any, ...]:
+    if isinstance(item, CSVWindowCandidate):
+        return (
+            bool(item.label_is_malicious),
+            -int(item.severity_min or 99),
+            -int(item.flow_packets_per_s or 0),
+        )
     return (
         bool(item["csv_features"]["label_is_malicious"]),
         -int(item.get("severity_min") or 99),
@@ -232,46 +239,36 @@ def _window_priority_key(item: Dict[str, Any]) -> tuple[Any, ...]:
 
 
 def _sample_jsonl_windows(
-    all_output: Path,
-    include_benign: bool,
+    candidates: List[CSVWindowCandidate],
     topk: int,
     selection_mode: str,
     seed: int,
-) -> List[Dict[str, Any]]:
-    if topk <= 0:
-        return []
+) -> List[CSVWindowCandidate]:
+    effective_topk = topk if topk > 0 else None
 
     if selection_mode == "priority":
-        selected_windows: List[Dict[str, Any]] = []
-        for item in _iter_jsonl(all_output):
-            if include_benign or bool((item.get("csv_features") or {}).get("label_is_malicious")):
-                selected_windows.append(item)
+        selected_windows = list(candidates)
         selected_windows.sort(key=_window_priority_key, reverse=True)
-        return selected_windows[:topk]
+        return selected_windows if effective_topk is None else selected_windows[:effective_topk]
 
     rng = random.Random(seed)
-    eligible_items: List[Dict[str, Any]] = []
-    for item in _iter_jsonl(all_output):
-        if include_benign or bool((item.get("csv_features") or {}).get("label_is_malicious")):
-            eligible_items.append(item)
+    eligible_items = list(candidates)
 
     if selection_mode == "random":
-        if len(eligible_items) <= topk:
+        if effective_topk is None or len(eligible_items) <= effective_topk:
             rng.shuffle(eligible_items)
             return eligible_items
-        return rng.sample(eligible_items, topk)
+        return rng.sample(eligible_items, effective_topk)
 
     if selection_mode != "stratified_label":
         raise ValueError(f"unsupported selection_mode: {selection_mode}")
 
-    buckets: Dict[str, List[Dict[str, Any]]] = {}
+    buckets: Dict[str, List[CSVWindowCandidate]] = {}
     for item in eligible_items:
-        features = item.get("csv_features") or {}
-        label = str(features.get("label") or "UNKNOWN")
-        buckets.setdefault(label, []).append(item)
+        buckets.setdefault(item.label or "UNKNOWN", []).append(item)
 
     labels = sorted(buckets)
-    if len(eligible_items) <= topk:
+    if effective_topk is None or len(eligible_items) <= effective_topk:
         sampled = []
         for label in labels:
             group = list(buckets[label])
@@ -281,7 +278,7 @@ def _sample_jsonl_windows(
         return sampled
 
     desired = {label: 0 for label in labels}
-    remaining = topk
+    remaining = effective_topk
 
     # First pass: guarantee as many labels as possible appear at least once.
     shuffled_labels = labels[:]
@@ -317,7 +314,22 @@ def _sample_jsonl_windows(
         else:
             sampled.extend(rng.sample(group, quota))
     rng.shuffle(sampled)
-    return sampled[:topk]
+    return sampled[:effective_topk]
+
+
+def _load_windows_by_offsets(all_output: Path, candidates: List[CSVWindowCandidate]) -> List[Dict[str, Any]]:
+    if not candidates:
+        return []
+
+    windows: List[Dict[str, Any]] = []
+    with all_output.open("r", encoding="utf-8") as f:
+        for candidate in candidates:
+            f.seek(candidate.offset)
+            line = f.readline()
+            if not line:
+                continue
+            windows.append(json.loads(line))
+    return windows
 
 
 def build_csv_flow_inputs(
@@ -338,6 +350,8 @@ def build_csv_flow_inputs(
     benign_rows = 0
     malicious_rows = 0
 
+    candidates: List[CSVWindowCandidate] = []
+
     with csv_path.open("r", encoding="utf-8", errors="ignore", newline="") as f, all_output.open("w", encoding="utf-8") as all_out:
         reader = csv.DictReader(f)
         for row_id, row in enumerate(reader, start=1):
@@ -350,14 +364,28 @@ def build_csv_flow_inputs(
             else:
                 benign_rows += 1
 
+            line_offset = all_out.tell()
             all_out.write(json.dumps(window, ensure_ascii=False) + "\n")
-    selected_windows = _sample_jsonl_windows(
-        all_output=all_output,
-        include_benign=include_benign,
+
+            if include_benign or label_is_malicious:
+                features = window.get("csv_features") or {}
+                candidates.append(
+                    CSVWindowCandidate(
+                        offset=line_offset,
+                        label=str(features.get("label") or "UNKNOWN"),
+                        label_is_malicious=label_is_malicious,
+                        severity_min=int(window.get("severity_min") or 99),
+                        flow_packets_per_s=float(features.get("flow_packets_per_s") or 0.0),
+                    )
+                )
+
+    selected_candidates = _sample_jsonl_windows(
+        candidates=candidates,
         topk=topk,
         selection_mode=selection_mode,
         seed=seed,
     )
+    selected_windows = _load_windows_by_offsets(all_output, selected_candidates)
 
     with selected_output.open("w", encoding="utf-8") as sel_out:
         for item in selected_windows:

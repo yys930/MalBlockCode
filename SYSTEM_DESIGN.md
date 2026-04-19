@@ -3,119 +3,126 @@
 ## 1. 项目概述
 **项目名称**：MalBlock — 基于 LLM 的恶意流量阻断研究系统  
 **运行环境**：Ubuntu 22.04 虚拟机  
-**数据集**：CIC-IDS-2017（PCAP + TrafficLabelling CSV）
+**主要数据集**：CIC-IDS-2017（PCAP + TrafficLabelling CSV）
 
 **研究目标**：  
-构建一个可运行、可评估、可解释的恶意流量阻断系统，支持三类输入通道：
+构建一个可运行、可评估、可解释、可执行的恶意流量阻断系统。系统不仅输出“恶意/正常”判断，而是输出结构化阻断策略，并通过 `nftables` 执行 `drop / rate_limit / watch` 三类动作。
+
+系统当前支持三类实验通道：
 - **通道 A：离线 PCAP 检测通道**
-- **通道 B：PCAP 真实回放 / 在线检测通道**
-- **通道 C：CSV 流级直读通道**
+- **通道 B：在线回放 / 流式处理通道**
+- **通道 C：CSV 结构化流级通道**
 
-系统目标不是只输出“恶意/正常”分类结果，而是输出**结构化阻断策略**，并通过 `nftables` 真正执行 `drop / rate_limit / watch` 三类动作。
+当前系统已实现从流量输入到策略执行、评估分析、前端展示的完整实验链路，形成如下闭环：
 
-**闭环定义**：  
-`流量输入 → 检测告警 / 流特征 → 结构化证据 → RAG+LLM 决策 → 阻断执行 → 评估分析 → 策略修正`
+`流量输入 -> 检测告警 / 流特征 -> 结构化证据 -> RAG + LLM 决策 -> nftables 执行 -> 结构化评估 -> 前端展示`
 
 ---
 
 ## 2. 设计原则与研究假设
 
 ### 2.1 设计原则
-1. **可复现**：离线 PCAP、真实回放、CSV 理想输入三种实验链路可重复运行。
+1. **可复现**：离线、在线回放、CSV 三类通道均能重复运行。
 2. **可解释**：LLM 决策必须输出结构化证据、策略字段与执行结果。
-3. **可评估**：区分“数据覆盖”“决策正确性”“执行效果”“闭环反馈”。
-4. **可控安全**：阻断动作受白名单、TTL、执行模式约束，不允许 LLM 任意下发高风险动作。
-5. **可扩展**：支持后续替换模型、RAG 检索方式、执行策略与可视化界面。
+3. **可评估**：评估不仅包含分类指标，也包含执行效果、重复处置、短路处置和压制效果。
+4. **可控安全**：LLM 不能直接任意下发高风险动作，执行受白名单、TTL、策略模板与运行时修正规则约束。
+5. **可扩展**：支持后续替换模型、RAG 检索方式、策略模板和展示前端。
 
 ### 2.2 研究假设
-1. LLM 可基于结构化告警/流特征生成合理的阻断策略，而不是只做标签分类。
-2. 引入 RAG 历史策略案例，有助于提高处置一致性与解释性。
-3. 通道 A/B 更适合评估**干预后告警压制效果**。
-4. 通道 C 更适合评估**在理想结构化输入条件下，LLM 对恶意流的策略选择能力上限**。
+1. LLM 可以基于结构化证据生成可执行阻断策略，而非仅输出标签分类。
+2. 引入 RAG 历史策略案例可提升处置一致性和解释性。
+3. 离线/在线回放更适合评估检测与干预后的执行效果。
+4. CSV 通道更适合评估在理想结构化输入条件下的策略决策上限。
 
 ---
 
 ## 3. 系统总体架构
 
 ### 3.1 架构分层
-1. **输入层**：PCAP 离线/在线回放、CSV 流记录
+1. **输入层**：PCAP 离线、在线回放、CSV 流记录
 2. **检测层**：Suricata 生成 `eve.json`
 3. **处理层**：告警抽取、噪声过滤、时间窗聚合、CSV 适配
 4. **决策层**：RAG + LLM Agent
 5. **执行层**：MCP + nftables
-6. **评估层**：结构化评估报告生成
-7. **展示层**：后续可接 Web Dashboard
+6. **评估层**：结构化评估报告
+7. **展示层**：Web Dashboard
 
-### 3.2 数据流
-1. **通道 A：离线 PCAP**
-   - `suricata -r` 读取 PCAP
-   - 生成 `eve.json`
-   - 抽取告警、聚合时间窗、进入 Agent
+### 3.2 当前三类通道的数据流
 
-2. **通道 B：真实回放 / 在线检测**
-   - `tcpreplay` 回放 PCAP 到指定接口
-   - Suricata 在线监听宿主机接口
-   - 抽取告警、聚合时间窗、进入 Agent
+#### 通道 A：离线 PCAP
+1. `suricata -r` 读取 PCAP
+2. 输出 `eve.json`
+3. 抽取 `alert`
+4. 过滤噪声 signature
+5. 按 `src_ip + window_sec` 聚合
+6. 取 top-k 窗口进入 LLM
+7. 输出结构化决策并执行 nft
+8. 生成评估报告
 
-3. **通道 C：CSV 流级模式**
-   - 直接读取 `TrafficLabelling` CSV
-   - 将每条流记录映射为统一 `window`
-   - 不依赖 Suricata 告警
+#### 通道 B：在线回放 / 流式处理
+1. Suricata 在线监听指定接口
+2. `tcpreplay` 持续回放 PCAP 到指定接口或 netns 中的虚拟接口
+3. Suricata 持续产生新的 `eve.json` 告警
+4. 系统维护 `eve.json` 读取偏移量，仅增量读取**新产生的 alert**
+5. 每隔一个 `window_sec` 周期触发一次处理：
+   - 收集该周期内新产生的告警
+   - 对新增告警做聚合
+   - 依据 `hits / severity / 目标集中度 / burst` 排序
+   - 选取该周期 top-k 窗口送入 LLM
+6. LLM 决策后立即执行 nft
+7. 下一周期继续处理后续新增告警
 
-4. **统一后续处理**
-   - 构造 `llm_inputs_selected.jsonl`
-   - 构造 LLM message
-   - 注入 RAG 与批次内上下文
-   - 生成结构化决策并执行
-   - 写出评估报告
+这意味着当前在线通道已经不再是“回放结束后统一批处理”，而是**滚动窗口式流式处理**。
+
+#### 通道 C：CSV 结构化流级模式
+1. 直接读取 `TrafficLabelling` CSV
+2. 将每条流记录映射为统一 `window`
+3. 采样后直接构造消息
+4. 进入 LLM 决策和执行层
+5. 输出评估报告
 
 ---
 
 ## 4. 输入与数据集设计
 
-### 4.1 CIC-IDS-2017 数据源选择
-本项目主数据源优先使用：
-- `TrafficLabelling`
-
-原因：
-- 包含 `Source IP / Destination IP / Port / Timestamp / Label`
-- 能直接映射到阻断目标
+### 4.1 主数据源选择
+主数据源优先使用 CIC-IDS-2017 的 `TrafficLabelling`，原因是：
+- 含 `Source IP / Destination IP / Port / Timestamp / Label`
+- 便于映射阻断目标
 - 更适合 CSV 通道与阻断系统设计
 
-`MachineLearningCVE` 更适合作为传统 ML 分类基线，不作为本系统主输入。
+`MachineLearningCVE` 更适合作为传统 ML 分类基线，不是本系统主输入。
 
-### 4.2 恶意流量总集构建
-已实现恶意总集构建脚本：
-- `backend/dataset/cic_ids2017_builder.py`
-- `backend/scripts/build_cic_dataset.py`
+### 4.2 恶意总集构建
+已实现：
+- [backend/dataset/cic_ids2017_builder.py](/home/os/FinalCode/malblock/backend/dataset/cic_ids2017_builder.py)
+- [backend/scripts/build_cic_dataset.py](/home/os/FinalCode/malblock/backend/scripts/build_cic_dataset.py)
 
 当前输出：
 - `backend/datasets/cic_ids2017_trafficlabelling/malicious_merged_cleaned.csv`
 - `backend/datasets/cic_ids2017_trafficlabelling/manifest.json`
 
-当前构建规则：
-- 遍历 `TrafficLabelling` 下全部 CSV
+构建规则：
+- 遍历全部 `TrafficLabelling` CSV
 - 仅保留恶意流量
 - 清洗关键字段
 - 去重
-- 保留来源信息：
+- 保留来源字段：
   - `source_file`
   - `source_day`
   - `original_row_id`
 
-该数据集是当前 CSV 通道的主输入。
-
-### 4.3 CSV 通道多样化采样
-为避免固定优先级采样总是落在 `DDoS` 热点上，CSV 通道现支持三种样本选择模式：
-
+### 4.3 CSV 通道采样模式
+当前支持三种采样模式：
 - `priority`
-  - 按恶意优先、严重度、包速排序
+  - 恶意优先、严重度高优先、包速高优先
 - `random`
   - 全局随机抽样
 - `stratified_label`
-  - 按恶意标签分层随机抽样，优先覆盖所有恶意类型
+  - 按标签分层随机抽样，尽量覆盖更多攻击类型
 
-当前推荐实验参数：
+推荐论文实验参数：
+
 ```bash
 --topk 100 --exclude-benign --selection-mode stratified_label --seed 42
 ```
@@ -124,37 +131,45 @@
 
 ## 5. 模块设计
 
-### 5.1 输入与统一作业管理
-**功能**：统一管理三类输入通道和输出目录。
-
+### 5.1 统一通道入口
 主要入口：
-- `backend/scripts/run_offline_channel.py`
-- `backend/scripts/run_replay_channel.py`
-- `backend/scripts/run_csv_channel.py`
-- `backend/scripts/run_channel.py`
+- [backend/scripts/run_offline_channel.py](/home/os/FinalCode/malblock/backend/scripts/run_offline_channel.py)
+- [backend/scripts/run_replay_channel.py](/home/os/FinalCode/malblock/backend/scripts/run_replay_channel.py)
+- [backend/scripts/run_csv_channel.py](/home/os/FinalCode/malblock/backend/scripts/run_csv_channel.py)
+- [backend/scripts/run_channel.py](/home/os/FinalCode/malblock/backend/scripts/run_channel.py)
 
 统一输出目录：
 - `backend/jobs/<job_id>/`
 
 统一摘要文件：
-- `backend/jobs/<job_id>/channel_summary.json`
+- `channel_summary.json`
+- `evaluation_report.json`
 
-### 5.2 告警抽取与过滤模块
-**适用**：通道 A/B  
-**功能**：
-- 从 `eve.json` 抽取 `alert`
-- 过滤已知噪声 signature
-- 清理缺失关键字段的告警
+### 5.2 告警抽取与过滤
+适用：通道 A / B
 
 主要文件：
-- `backend/pipeline/suricata_alerts.py`
+- [backend/pipeline/suricata_alerts.py](/home/os/FinalCode/malblock/backend/pipeline/suricata_alerts.py)
+
+功能：
+- 从 `eve.json` 抽取 `event_type=alert`
+- 清理缺失字段
+- 过滤已知噪声 signature：
+  - invalid checksum
+  - invalid ack
+  - unable to match response to request
+  - request header invalid
+  - gzip decompression failed
 
 输出：
+- `alerts_raw.jsonl`
 - `alerts_filtered.jsonl`
 
-### 5.3 时间窗聚合模块
-**适用**：通道 A/B  
-**功能**：按 `src_ip + window_sec` 聚合告警窗口。
+### 5.3 时间窗聚合
+适用：通道 A / B
+
+主要文件：
+- [backend/pipeline/window_aggregate.py](/home/os/FinalCode/malblock/backend/pipeline/window_aggregate.py)
 
 主要特征：
 - `hits`
@@ -170,61 +185,38 @@
 - `dest_ports`
 - `top_dest_ips`
 
+当前排序逻辑：
+- `hits` 越高越优先
+- `severity_min` 越高风险越优先
+- 目标越集中越优先
+- burst 越明显越优先
+
+### 5.4 CSV 流级适配
+适用：通道 C
+
 主要文件：
-- `backend/pipeline/window_aggregate.py`
+- [backend/pipeline/csv_flow_adapter.py](/home/os/FinalCode/malblock/backend/pipeline/csv_flow_adapter.py)
 
-输出：
-- `llm_inputs_selected.jsonl`
-
-### 5.4 CSV 流级适配模块
-**适用**：通道 C  
-**功能**：将 `TrafficLabelling` 恶意流量总集直接映射为统一 `window`。
-
-主要文件：
-- `backend/pipeline/csv_flow_adapter.py`
-
-当前适配能力：
-- 支持 ISO 时间解析
+当前能力：
+- 支持 ISO / 多种常见时间格式解析
 - 支持 `malicious_merged_cleaned.csv`
-- 为每条流构造：
-  - `flow_uid`
-  - `source_file`
-  - `source_day`
-  - `source_row_id`
-- 从 `label` 派生：
+- 为每条流构造统一 window
+- 自动派生：
   - `attack_family`
   - `severity`
   - `CSV_FLOW::<label>` 伪 signature
 
-作用：
-- 用于理想化结构化输入实验
-- 用于快速验证 Agent 决策策略
-
-### 5.5 RAG + LLM 决策模块
-**功能**：对结构化证据进行策略决策，并在需要时触发执行工具。
-
+### 5.5 RAG + LLM 决策
 主要文件：
-- `backend/agent/message_builder.py`
-- `backend/agent/build_messages.py`
-- `backend/agent/prompt.py`
-- `backend/agent/policy.py`
-- `backend/agent/llm_agent_sf.py`
-- `backend/agent/run_agent_batch.py`
+- [backend/agent/message_builder.py](/home/os/FinalCode/malblock/backend/agent/message_builder.py)
+- [backend/agent/build_messages.py](/home/os/FinalCode/malblock/backend/agent/build_messages.py)
+- [backend/agent/prompt.py](/home/os/FinalCode/malblock/backend/agent/prompt.py)
+- [backend/agent/policy.py](/home/os/FinalCode/malblock/backend/agent/policy.py)
+- [backend/agent/llm_agent_sf.py](/home/os/FinalCode/malblock/backend/agent/llm_agent_sf.py)
+- [backend/agent/run_agent_batch.py](/home/os/FinalCode/malblock/backend/agent/run_agent_batch.py)
 
-#### 5.5.1 RAG 历史策略案例
-主要文件：
-- `backend/agent/rag_store.py`
-- `backend/rag/decision_history.jsonl`
-- `backend/rag/chroma_db`
-
-当前检索对象不是原始告警文本，而是历史**策略案例**：
-- `incident_profile`
-- `historical_strategy`
-- `execution_result`
-- `feedback`
-
-#### 5.5.2 Agent 输入
-每条 message 当前包含：
+#### 5.5.1 当前消息结构
+每条 message 包含：
 - `constraints`
 - `hints`
 - `window`
@@ -233,64 +225,42 @@
 - `decision_context`
 - `meta`
 
-#### 5.5.3 Agent 动态决策增强
-当前 Agent 不再只依赖模型自由输出，而是加入了：
+#### 5.5.2 RAG 检索对象
+当前不是检索原始告警，而是检索历史策略案例：
+- `incident_profile`
+- `historical_strategy`
+- `execution_result`
+- `feedback`
 
-1. **决策上下文增强**
-   - `prior_block_count`
-   - `prior_rate_limit_count`
-   - `prior_watch_count`
-   - `same_attack_family_seen_count`
-   - `same_label_seen_count`
-   - `current_enforcement_mode`
-   - `current_enforcement_ttl_sec`
-   - `max_block_ttl_sec_seen`
+#### 5.5.3 动态上下文与递进处罚
+当前已实现：
+- 同一 `src_ip` 的批次内历史上下文
+- `prior_block_count / prior_rate_limit_count / prior_watch_count`
+- `same_attack_family_seen_count / same_label_seen_count`
+- `current_enforcement_mode / current_enforcement_ttl_sec`
+- `max_block_ttl_sec_seen`
 
-2. **Prompt 层递进处罚要求**
-   - 同一 `src_ip` 重复恶意时要求体现递进处罚
-   - 不鼓励机械重复给低强度处罚
-   - 已有同等级或更强处置时，要求考虑“已有策略覆盖”
-
-3. **运行时 TTL 纠偏**
-   - 模型给出的 `ttl_sec` 不再直接被信任
-   - `block/rate_limit/watch` 的工具参数会至少达到策略推荐 TTL
-   - 同一 IP 重复恶意时会按上下文进行平滑升级
-
-4. **执行短路**
-   - 如果同一 job 内某个 `src_ip` 已经处于同等级或更强处置状态
-   - 当前 Agent 不再重复下发同类工具
-   - 会返回：
-     - `covered_by_existing_action`
-     - `skipped_execution`
-
-5. **附加解释字段**
-   - `decision_state`
-     - `new_block`
-     - `escalated_block`
-     - `covered_by_existing_block`
-   - `ttl_reason`
-     - 说明 TTL 来源与升级依据
+对应效果：
+- 重复恶意流量会触发 TTL 升级
+- 已有同等级或更强处置时，会短路执行
+- 产生：
+  - `skipped_execution`
+  - `covered_by_existing_action`
+  - `covered_by_existing_block`
 
 ### 5.6 执行模块
-**实现方式**：MCP + nftables
-
 主要文件：
-- `backend/agent/mcp_enforcer_server.py`
-- `backend/agent/mcp_enforcer_client.py`
+- [backend/agent/mcp_enforcer_server.py](/home/os/FinalCode/malblock/backend/agent/mcp_enforcer_server.py)
+- [backend/agent/mcp_enforcer_client.py](/home/os/FinalCode/malblock/backend/agent/mcp_enforcer_client.py)
 
-可调用工具：
+支持工具：
 - `block_ip`
 - `rate_limit_ip`
 - `watch_ip`
 - `unblock_ip`
 - `list_blocked`
 
-#### 5.6.1 nftables 对象
-初始化脚本：
-- `backend/scripts/init_nftables.sh`
-- `backend/scripts/reset_nftables.sh`
-
-当前实际使用的 set：
+当前 nft set：
 - `blocklist_v4`
 - `ratelimit_v4`
 - `watchlist_v4`
@@ -298,26 +268,42 @@
 当前 live 规则含义：
 - `blocklist_v4` -> 直接 `drop`
 - `ratelimit_v4` -> 限速通过，超限 `drop`
-- `watchlist_v4` -> 限速记录日志，不阻断
+- `watchlist_v4` -> 记录日志，不阻断
 
-#### 5.6.2 执行保障
-- 支持 `DRY_RUN`
-- 支持审计日志
-- 支持白名单保护
-- 支持对重复下发返回 `already_present`
+当前执行保障：
+- `DRY_RUN`
+- 白名单保护
+- 审计日志
+- 重复下发识别
+
+### 5.7 在线实验环境
+为了支持真正的在线回放实验，当前已增加专用环境脚本：
+- [backend/scripts/init_replay_env.sh](/home/os/FinalCode/malblock/backend/scripts/init_replay_env.sh)
+- [backend/scripts/reset_replay_env.sh](/home/os/FinalCode/malblock/backend/scripts/reset_replay_env.sh)
+
+默认创建：
+- `netns = mbreplay`
+- Suricata 监听接口：`veth-mb-host`
+- tcpreplay 回放接口：`veth-mb-replay`
+- 默认将两端 veth MTU 调整为 `9000`
+
+该环境用于保证：
+- 回放流量和监听流量路径可控
+- 在线实验可重复搭建
+- 降低 `tcpreplay` 在 veth 环境中因超 MTU 报文触发 `Message too long` 的概率
 
 ---
 
 ## 6. LLM Agent 设计
 
 ### 6.1 决策输入
-- `constraints`：系统硬约束
-- `hints`：从窗口派生的高层特征
-- `window`：压缩后的主证据
-- `evidence_window`：完整证据
-- `retrieved_evidence`：RAG 历史案例
-- `decision_context`：当前批次内同一源 IP 的历史状态
-- `meta`：作业与工具调用审计信息
+- `constraints`
+- `hints`
+- `window`
+- `evidence_window`
+- `retrieved_evidence`
+- `decision_context`
+- `meta`
 
 ### 6.2 决策输出
 输出必须为 JSON-only，核心字段：
@@ -347,130 +333,117 @@
 }
 ```
 
-### 6.3 约束策略
-- action 必须来自允许集合
-- `noise_only` 时禁止自动 block
-- TTL 受最小/最大边界约束
-- 禁止封禁白名单 IP
-- 不确定时默认 `review`
-- 输出的 `target.value` 必须与 `src_ip` 一致
-
-### 6.4 策略模板与递进升级
-当前模板按 `attack_family` 预置：
-- `dos_containment`
-- `credential_abuse_control`
-- `recon_escalation`
-- `dns_abuse_watch`
-- `botnet_containment`
-- `web_attack_block`
-- `generic_triage`
-
-动态升级依赖：
-- 当前样本危险程度
-- 同一 IP 在当前批次中的历史 block/monitor/watch/rate-limit 次数
-- 同一 IP 是否重复出现相同攻击族或标签
-- 历史案例检索结果
-
-### 6.5 运行时保护
-- 进入 LLM 前先执行 `precheck_action`
-- 工具参数由运行时补全
-- 输出不合法则回退 `fallback`
-- 若工具已执行但结果与策略不一致，系统自动纠偏
+### 6.3 运行时保护
+当前已实现：
+- 进入模型前 `precheck_action`
+- 输出 schema 校验
+- 工具参数运行时补全
+- 工具失败时 fallback
+- 已有更强策略时短路执行
 
 ---
 
 ## 7. 评估模块设计
 
-### 7.1 评估目标
-评估模块不是只算 `F1`，而是同时回答：
-1. 本次样本覆盖情况如何
-2. Agent 决策是否正确
-3. 工具执行是否成功
-4. 是否存在重复处置
-5. 对不同攻击类型的表现是否一致
-
-### 7.2 评估实现
 主要文件：
-- `backend/eval/channel_eval.py`
+- [backend/eval/channel_eval.py](/home/os/FinalCode/malblock/backend/eval/channel_eval.py)
 
 统一输出：
-- `backend/jobs/<job_id>/evaluation_report.json`
+- `evaluation_report.json`
 
-### 7.3 当前评估报告结构
-当前 `evaluation_report.json` 包含：
-
-- `job_meta`
-- `dataset_summary`
-- `decision_eval`
-- `execution_eval`
-- `error_analysis`
-- `samples`
-- `effect_eval`
-
-### 7.4 CSV 通道当前评估能力
-**数据摘要**
-- `input_rows`
-- `selected_rows`
-- `label_distribution`
-- `attack_family_distribution`
-- `source_day_distribution`
-- `unique_src_ip_count`
-- `unique_flow_uid_count`
-
-**决策评估**
+### 7.1 CSV 通道评估
+当前支持：
 - `tp / fp / tn / fn`
 - `precision / recall / f1`
-- `matched_decisions / unmatched_decisions`
 - `per_label_metrics`
 - `per_attack_family_metrics`
 - `per_source_day_metrics`
+- `false_positive_cases / false_negative_cases / review_cases`
 
-**执行评估**
-- `tool_success_count`
-- `tool_failure_count`
-- `already_present_count`
-- `repeat_enforcement_ratio`
-- `unique_blocked_ip_count`
-- `unique_rate_limited_ip_count`
-- `unique_watched_ip_count`
-
-**错误分析**
-- `false_positive_cases`
-- `false_negative_cases`
-- `review_cases`
-- `unmatched_cases`
-
-### 7.5 A/B 通道评估重点
-离线/回放通道当前主要做：
+### 7.2 离线 / 在线通道评估
+当前重点：
 - `action_distribution`
 - `execution_mode_distribution`
-- 工具执行统计
-- `suppression_ratio`
-
-### 7.6 当前已知评估结论
-在 `csv_malicious_stratified_001` 和 `csv_malicious_stratified_002` 中已经验证：
-- `stratified_label` 确实能覆盖 14 类恶意标签
-- 评估已能正确反映样本分布与执行冗余
-- `csv_malicious_stratified_002` 中动态 TTL 升级已显现
+- `tool_success_count / tool_failure_count`
+- `skipped_execution_count`
+- `covered_by_existing_action_count`
+- `mean_suppression_ratio`
 
 ---
 
-## 8. 实验运行与复现
+## 8. 前端展示层设计
 
-### 8.1 恶意总集构建
-```bash
-python3 backend/scripts/build_cic_dataset.py \
-  --input-dir /home/os/FinalCode/data/CIC-IDS-2017/CSVs/TrafficLabelling \
-  --output-dir /home/os/FinalCode/malblock/backend/datasets/cic_ids2017_trafficlabelling \
-  --dedupe-mode flow \
-  --progress-every 200000
-```
+主要文件：
+- [frontend/src/App.jsx](/home/os/FinalCode/malblock/frontend/src/App.jsx)
+- [frontend/src/styles.css](/home/os/FinalCode/malblock/frontend/src/styles.css)
 
-### 8.2 CSV 通道推荐运行方式
+当前前端已落地为研究平台控制台，支持：
+- 主页面选择三类实验通道
+- 各通道独立控制面板
+- 历史 job 列表
+- LLM 决策流展示
+- nft 执行流展示
+- 最终实验结果展示
+- 结构化评估摘要
+- **nft 实时状态模块**
+
+### 8.1 nft 实时状态模块
+当前每个通道页面都支持读取系统实时 nft 状态，展示：
+- `blocklist_v4`
+- `ratelimit_v4`
+- `watchlist_v4`
+
+每个集合当前展示：
+- 成员数
+- 每个成员的 IP
+- `TTL`
+- `剩余时间`
+
+该模块不依赖历史 job，而是读取系统当前 live nft 状态。
+
+---
+
+## 9. 当前项目进度
+
+### 9.1 已完成
+1. 恶意总集构建完成
+2. CSV 通道适配完成
+3. CSV 多种采样模式完成
+4. 离线 PCAP 通道完成
+5. 在线回放通道完成
+6. 在线通道已升级为**流式窗口处理**
+7. RAG + LLM 决策链完成
+8. MCP + nftables 执行链完成
+9. 动态 TTL 升级与短路执行完成
+10. 结构化评估模块完成
+11. Web 前端控制台完成
+12. nft 实时状态展示完成
+13. 在线实验环境脚本完成
+14. 系统级 nftables 持久化配置完成
+
+### 9.2 当前系统状态
+当前系统已经不再是脚本拼接验证，而是一个完整的实验平台，具备：
+- 可运行
+- 可评估
+- 可解释
+- 可执行
+- 可展示
+
+### 9.3 当前仍待优化
+1. 在线通道虽然已流式化，但仍以 `eve.json` 增量读取为主，后续可进一步演进为更严格的实时事件驱动处理。
+2. `evaluation_report -> RAG feedback` 还未自动回写闭环。
+3. 离线通道仍可能受到高频噪声窗口影响，后续可继续优化预筛选策略。
+4. 前端图表与论文图表导出仍可继续增强。
+
+---
+
+## 10. 推荐运行方式
+
+### 10.1 CSV 通道
 ```bash
-python3 backend/scripts/run_csv_channel.py \
+python3 backend/scripts/run_channel.py csv \
   --csv /home/os/FinalCode/malblock/backend/datasets/cic_ids2017_trafficlabelling/malicious_merged_cleaned.csv \
-  --job-id csv_malicious_stratified_002 \
+  --job-id csv_malicious_stratified_001 \
   --topk 100 \
   --exclude-benign \
   --selection-mode stratified_label \
@@ -478,46 +451,58 @@ python3 backend/scripts/run_csv_channel.py \
   --rag-top-k 3
 ```
 
-### 8.3 评估命令
+### 10.2 离线通道
 ```bash
-PYTHONPATH=backend python3 - <<'PY'
-from eval.channel_eval import evaluate_job
-evaluate_job('/home/os/FinalCode/malblock/backend/jobs/csv_malicious_stratified_002')
-PY
+python3 backend/scripts/run_channel.py offline \
+  --pcap /home/os/FinalCode/data/CIC-IDS-2017/PCAPs/Tuesday-WorkingHours.pcap \
+  --job-id offline_tuesday_001 \
+  --window-sec 60 \
+  --min-hits 3 \
+  --topk 20 \
+  --rag-top-k 3
+```
+
+### 10.3 在线流式通道
+先初始化实验环境：
+
+```bash
+/home/os/FinalCode/malblock/backend/scripts/init_replay_env.sh
+```
+
+若需要显式指定 MTU，也可执行：
+
+```bash
+HOST_MTU=9000 REPLAY_MTU=9000 /home/os/FinalCode/malblock/backend/scripts/init_replay_env.sh
+```
+
+再运行在线通道：
+
+```bash
+/home/os/FinalCode/malblock/backend/MBvenv/bin/python \
+  /home/os/FinalCode/malblock/backend/scripts/run_channel.py replay \
+  --pcap /home/os/FinalCode/data/CIC-IDS-2017/PCAPs/Tuesday-WorkingHours.pcap \
+  --suricata-interface veth-mb-host \
+  --replay-interface veth-mb-replay \
+  --replay-netns mbreplay \
+  --job-id replay_tuesday_stream_001 \
+  --suricata-checksum-mode none \
+  --replay-speed topspeed \
+  --capture-wait-sec 2 \
+  --suricata-ready-timeout-sec 180 \
+  --window-sec 60 \
+  --min-hits 3 \
+  --topk 20 \
+  --rag-top-k 3
 ```
 
 ---
 
-## 9. 当前进展与待优化点
+## 11. 当前阶段总结
+MalBlock 当前已经完成从研究原型向“可演示、可执行、可评估的毕业设计系统”的升级。  
+其中最关键的当前进展有三点：
 
-### 9.1 已落地
-- 恶意总集构建完成
-- CSV 通道适配完成
-- 多样化采样完成
-- 评估模块结构化增强完成
-- Agent 动态上下文与 TTL 升级已落地
-- nftables 三类执行模式已在 live 系统中验证生效
+1. **LLM 不再只是分类器，而是结构化阻断策略生成器**
+2. **nftables 已真实接入执行链路**
+3. **在线通道已实现基于窗口周期的流式处理机制**
 
-### 9.2 当前待优化
-1. **重复执行统计需进一步纳入评估**
-   - 当前 Agent 已支持 `covered_by_existing_action`
-   - 后续应在评估中显式统计短路执行次数
-
-2. **TTL 升级曲线仍需继续调优**
-   - `csv_malicious_stratified_002` 已出现从 `300` 提升到 `10800/21600/86400`
-   - 但仍需进一步验证升级是否过于激进
-
-3. **RAG 反馈闭环还未完全闭合**
-   - 当前评估结果尚未自动反写回 `decision_history.jsonl` 的 `feedback`
-
-4. **前端展示层尚未落地**
-   - 目前仍以脚本与 JSON 报告为主
-
----
-
-## 10. 后续扩展方向
-1. 将 `covered_by_existing_action / skipped_execution` 纳入评估与论文图表
-2. 打通 `evaluation_report -> RAG feedback` 闭环
-3. 增加基于 `MachineLearningCVE` 的传统 ML 基线对比
-4. 开发最小可用的 Web Dashboard
-5. 增强 replay 通道的真实阻断效果评估
+因此，当前系统已经具备较强的论文实现价值和答辩展示价值。

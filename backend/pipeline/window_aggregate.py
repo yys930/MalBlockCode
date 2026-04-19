@@ -167,6 +167,57 @@ def score_for_rank(agg: WindowAgg) -> Tuple[int, int, int, int]:
     return (agg.hits, -sev, -len(agg.dest_ip_counter), -burst)
 
 
+def aggregate_alert_records(
+    records: List[Dict[str, Any]],
+    window_sec: int = 60,
+    min_hits: int = 3,
+    topk: int = 200,
+    top_sig_n: int = 5,
+    top_dest_ip_n: int = 3,
+) -> Dict[str, Any]:
+    groups: Dict[Tuple[str, int], WindowAgg] = {}
+
+    for rec in records:
+        ts = rec.get("timestamp")
+        src_ip = rec.get("src_ip")
+        if not ts or not src_ip:
+            continue
+
+        dt = parse_ts(ts)
+        epoch = dt_to_epoch(dt)
+        win_id = epoch // window_sec
+        win_start = win_id * window_sec
+        win_end = win_start + window_sec
+        key = (src_ip, win_id)
+        if key not in groups:
+            groups[key] = WindowAgg(src_ip=src_ip, window_id=win_id, window_start=win_start, window_end=win_end)
+        groups[key].add(rec, epoch)
+
+    all_aggs = list(groups.values())
+    all_aggs_sorted = sorted(all_aggs, key=lambda a: (a.window_start, a.src_ip))
+    selected = [a for a in all_aggs if a.hits >= min_hits]
+    selected.sort(key=score_for_rank, reverse=True)
+    if topk is not None and topk > 0:
+        selected = selected[:topk]
+
+    return {
+        "total_groups": len(all_aggs_sorted),
+        "selected_groups": len(selected),
+        "all_windows": [a.to_llm_input(top_sig_n, top_dest_ip_n) for a in all_aggs_sorted],
+        "selected_windows": [a.to_llm_input(top_sig_n, top_dest_ip_n) for a in selected],
+        "top_preview_selected": [
+            {
+                "src_ip": a.src_ip,
+                "window_start_iso": epoch_to_iso(a.window_start),
+                "hits": a.hits,
+                "severity_min": None if a.severity_min == 999 else a.severity_min,
+                "top_signature": a.sig_counter.most_common(1)[0][0] if a.sig_counter else None,
+            }
+            for a in selected[:10]
+        ],
+    }
+
+
 def aggregate_time_windows(
     job_dir: str | Path,
     window_sec: int = 60,

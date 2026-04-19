@@ -9,6 +9,8 @@ venv/
 env/
 ENV/
 backend/MBvenv/
+frontend/node_modules/
+frontend/dist/
 
 # Local environment files
 .env

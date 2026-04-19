@@ -9,7 +9,12 @@ if str(BACKEND_ROOT) not in sys.path:
 
 load_dotenv()
 
-from pipeline.channel_runner import run_csv_channel, run_offline_channel, run_replay_channel
+from pipeline.channel_runner import (
+    DEFAULT_SURICATA_READY_TIMEOUT_SEC,
+    run_csv_channel,
+    run_offline_channel,
+    run_replay_channel,
+)
 
 
 def main() -> None:
@@ -34,7 +39,7 @@ def main() -> None:
     replay.add_argument("--replay-netns", default="")
     replay.add_argument("--tcpreplay-extra-arg", action="append", default=[])
     replay.add_argument("--capture-wait-sec", type=int, default=2)
-    replay.add_argument("--suricata-ready-timeout-sec", type=int, default=180)
+    replay.add_argument("--suricata-ready-timeout-sec", type=int, default=DEFAULT_SURICATA_READY_TIMEOUT_SEC)
     replay.add_argument("--window-sec", type=int, default=60)
     replay.add_argument("--min-hits", type=int, default=3)
     replay.add_argument("--topk", type=int, default=20)
