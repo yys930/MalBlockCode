@@ -36,7 +36,7 @@ NFT_BLOCK_SET = os.environ.get("NFT_SET", "blocklist_v4")
 NFT_RATE_LIMIT_SET = os.environ.get("NFT_RATE_LIMIT_SET", "ratelimit_v4")
 NFT_WATCH_SET = os.environ.get("NFT_WATCH_SET", "watchlist_v4")
 
-DEFAULT_CSV_PATH = str(resolve_project_path("backend/datasets/cic_ids2017_trafficlabelling/malicious_merged_cleaned.csv"))
+DEFAULT_CSV_PATH = str(resolve_project_path("backend/datasets/cic_ids2017_trafficlabelling/mixed_eval_cleaned.csv"))
 
 
 class RunRequest(BaseModel):
@@ -247,6 +247,7 @@ def _job_snapshot(job_dir: Path) -> Dict[str, Any]:
     summary = _safe_json_load(job_dir / "channel_summary.json")
     evaluation = _safe_json_load(job_dir / "evaluation_report.json")
     decisions = _load_decisions(job_dir)
+    decision_eval = evaluation.get("decision_eval") or {}
 
     return {
         "job_id": summary.get("job_id") or job_dir.name,
@@ -255,7 +256,7 @@ def _job_snapshot(job_dir: Path) -> Dict[str, Any]:
         "source_path": summary.get("source_path"),
         "summary": summary,
         "evaluation": evaluation,
-        "decision_count": len(decisions),
+        "decision_count": decision_eval.get("decision_count") or len(decisions),
         "timeline": _build_timeline(decisions),
         "distributions": {
             "action": _distribution(decisions, lambda item: item.get("action")),

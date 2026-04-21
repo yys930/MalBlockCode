@@ -20,7 +20,7 @@ const channelMeta = {
     finalTitle: "离线实验最终结果",
     finalNote: "汇总离线通道实验结束后的关键指标、策略分布与执行成效，作为最终实验结果展示。",
     evalTitle: "离线实验评估结果",
-    evalNote: "展示离线通道的结构化评估摘要，包括数据覆盖、决策质量、执行表现与关键风险样本。",
+    evalNote: "展示离线通道的结构化评估摘要，包括数据覆盖、决策有效性、执行有效性、收益观察与关键风险样本。",
     objectiveTitle: "实验目的",
     objectiveText: "复现离线 PCAP 样本在检测、聚合、LLM 决策与执行层上的完整闭环，适合做策略回溯和结果复盘。",
     recommendedTitle: "推荐参数",
@@ -66,7 +66,7 @@ const channelMeta = {
     finalTitle: "CSV 实验最终结果",
     finalNote: "汇总结构化输入实验的策略分布、性能指标与执行表现，用于分析理想输入条件下的上限表现。",
     evalTitle: "CSV 实验评估结果",
-    evalNote: "重点展示结构化评估指标，例如 Precision、Recall、F1，以及关键误判或风险样本。",
+    evalNote: "重点展示决策有效性指标，例如 Precision、Recall、F1，以及关键误判或风险样本。",
     objectiveTitle: "实验目的",
     objectiveText: "在理想结构化输入条件下评估 LLM 的策略选择能力，适合做快速跑批和策略分布对比实验。",
     recommendedTitle: "推荐参数",
@@ -104,9 +104,9 @@ const defaultForms = {
   csv: {
     job_id: "",
     rag_top_k: 3,
-    csv: "",
-    topk: 100,
-    exclude_benign: true,
+    csv: "/home/os/FinalCode/malblock/backend/datasets/cic_ids2017_trafficlabelling/mixed_eval_cleaned.csv",
+    topk: 1000,
+    exclude_benign: false,
     selection_mode: "stratified_label",
     seed: 42,
   },
@@ -749,22 +749,21 @@ function FinalSummary({ meta, job }) {
   const evaluation = job?.evaluation || {};
   const executionEval = evaluation.execution_eval || {};
   const strongMetrics = getStrongMetrics(evaluation);
-  const strategyEval = evaluation.strategy_eval || {};
-  const safetyEval = evaluation.safety_eval || {};
+  const effectEval = evaluation.effect_eval || {};
   const datasetSummary = evaluation.dataset_summary || {};
   const distributions = job?.distributions || {};
 
   const cards = [
     ["决策总量", job?.decision_count],
     ["样本规模", datasetSummary.selected_rows],
-    ["策略匹配率", formatRatio(strategyEval.strategy_match_rate)],
-    ["重复执行比", formatRatio(executionEval.repeat_enforcement_ratio)],
+    ["重复处置占比", formatRatio(executionEval.repeat_enforcement_ratio)],
     ["短路次数", executionEval.skipped_execution_count],
     ["强处置 Precision", formatDecimal(strongMetrics.precision)],
     ["强处置 Recall", formatDecimal(strongMetrics.recall)],
     ["强处置 F1", formatDecimal(strongMetrics.f1)],
     ["唯一阻断 IP", executionEval.unique_blocked_ip_count],
-    ["安全预检次数", safetyEval.precheck_intervention_count],
+    ["执行一致性", formatRatio(executionEval.decision_to_execution_consistency)],
+    ["平均压制率", formatRatio(effectEval.mean_suppression_ratio)],
   ];
 
   return (
@@ -820,17 +819,14 @@ function EvaluationPanel({ meta, job, onEvaluate }) {
   const decisionEval = evaluation.decision_eval || {};
   const riskMetrics = getRiskMetrics(evaluation);
   const strongMetrics = getStrongMetrics(evaluation);
-  const strategyEval = evaluation.strategy_eval || {};
   const executionEval = evaluation.execution_eval || {};
   const effectEval = evaluation.effect_eval || {};
-  const safetyEval = evaluation.safety_eval || {};
 
   const riskCases = [
     ...(evaluation.error_analysis?.false_positive_cases || []),
     ...(evaluation.error_analysis?.false_negative_cases || []),
     ...(evaluation.error_analysis?.review_cases || []),
-    ...(evaluation.error_analysis?.strategy_mismatch_cases || []),
-    ...(evaluation.error_analysis?.constraint_violation_cases || []),
+    ...(evaluation.error_analysis?.unmatched_cases || []),
     ...(executionEval.tool_failed_cases || []),
   ].slice(0, 5);
 
@@ -871,42 +867,16 @@ function EvaluationPanel({ meta, job, onEvaluate }) {
             </div>
           </section>
           <section className="evaluation-block">
-            <h3>策略智能性</h3>
-            <div className="metric-mini-grid">
-              <div><span>策略匹配率</span><strong>{formatRatio(strategyEval.strategy_match_rate)}</strong></div>
-              <div><span>动作匹配率</span><strong>{formatRatio(strategyEval.action_match_rate)}</strong></div>
-              <div><span>执行模式匹配率</span><strong>{formatRatio(strategyEval.execution_mode_match_rate)}</strong></div>
-              <div><span>过度处置率</span><strong>{formatRatio(strategyEval.over_mitigation_rate)}</strong></div>
-              <div><span>处置不足率</span><strong>{formatRatio(strategyEval.under_mitigation_rate)}</strong></div>
-              <div><span>TTL 自适应分</span><strong>{formatDecimal(strategyEval.ttl_adaptation_score)}</strong></div>
-              <div><span>升级一致性</span><strong>{formatRatio(strategyEval.escalation_consistency)}</strong></div>
-              <div><span>策略评估样本</span><strong>{formatNumber(strategyEval.evaluated_decisions)}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
             <h3>执行有效性</h3>
             <div className="metric-mini-grid">
               <div><span>成功执行</span><strong>{formatNumber(executionEval.tool_success_count)}</strong></div>
               <div><span>失败执行</span><strong>{formatNumber(executionEval.tool_failure_count)}</strong></div>
-              <div><span>新增执行</span><strong>{formatNumber(executionEval.new_enforcement_count)}</strong></div>
-              <div><span>重复/短路执行</span><strong>{formatNumber(executionEval.repeat_enforcement_count)}</strong></div>
-              <div><span>重复执行比</span><strong>{formatRatio(executionEval.repeat_enforcement_ratio)}</strong></div>
+              <div><span>有效执行</span><strong>{formatNumber(firstDefined(executionEval.effective_enforcement_count, executionEval.new_enforcement_count))}</strong></div>
+              <div><span>重复处置次数</span><strong>{formatNumber(executionEval.repeat_enforcement_count)}</strong></div>
+              <div><span>重复处置占比</span><strong>{formatRatio(executionEval.repeat_enforcement_ratio)}</strong></div>
               <div><span>短路次数</span><strong>{formatNumber(executionEval.skipped_execution_count)}</strong></div>
               <div><span>已覆盖比例</span><strong>{formatRatio(executionEval.covered_by_existing_action_ratio)}</strong></div>
               <div><span>决策-执行一致性</span><strong>{formatRatio(executionEval.decision_to_execution_consistency)}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>安全可控性</h3>
-            <div className="metric-mini-grid">
-              <div><span>Protected 误封尝试</span><strong>{formatNumber(safetyEval.protected_ip_block_attempt_count)}</strong></div>
-              <div><span>Protected 安全处置</span><strong>{formatNumber(safetyEval.protected_ip_safe_handling_count)}</strong></div>
-              <div><span>Noise-only 误阻断</span><strong>{formatNumber(safetyEval.noise_only_false_block_count)}</strong></div>
-              <div><span>高噪声过激处置</span><strong>{formatNumber(safetyEval.high_noise_overreaction_count)}</strong></div>
-              <div><span>Fallback 次数</span><strong>{formatNumber(safetyEval.fallback_trigger_count)}</strong></div>
-              <div><span>约束违规数</span><strong>{formatNumber(safetyEval.constraint_violation_count)}</strong></div>
-              <div><span>预检干预数</span><strong>{formatNumber(safetyEval.precheck_intervention_count)}</strong></div>
-              <div><span>唯一阻断 IP</span><strong>{formatNumber(executionEval.unique_blocked_ip_count)}</strong></div>
             </div>
           </section>
           <section className="evaluation-block">
@@ -1009,7 +979,7 @@ function ReplayComparisonPanel({ form, updateForm, onCompare, loading, error, re
               <div><span>过滤告警差值</span><strong>{formatNumber(alertVolume.delta_filtered_alerts)}</strong></div>
               <div><span>过滤告警变化率</span><strong>{formatRatio(alertVolume.delta_filtered_alert_ratio)}</strong></div>
               <div><span>工具成功数差值</span><strong>{formatNumber(summaryDelta.tool_success_count_delta)}</strong></div>
-              <div><span>新增执行差值</span><strong>{formatNumber(summaryDelta.new_enforcement_count_delta)}</strong></div>
+              <div><span>有效执行差值</span><strong>{formatNumber(firstDefined(summaryDelta.effective_enforcement_count_delta, summaryDelta.new_enforcement_count_delta))}</strong></div>
               <div><span>唯一阻断 IP 差值</span><strong>{formatNumber(summaryDelta.unique_blocked_ip_count_delta)}</strong></div>
             </div>
           </section>

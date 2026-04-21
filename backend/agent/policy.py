@@ -133,8 +133,8 @@ def get_constraints() -> Dict[str, Any]:
         "never_block_ips": [
             "127.0.0.1",
             "192.168.71.1",   # VMware 网关
-            "192.168.10.1",   # 内网 DNS
-            "192.168.10.3",   # AD/DNS/LDAP/Kerberos/SMB 基础设施主机
+            # "192.168.10.1",   # 内网 DNS
+            # "192.168.10.3",   # AD/DNS/LDAP/Kerberos/SMB 基础设施主机
         ],
         # 可选：如果你不希望自动封内网主机，可设 True
         "never_block_private_src": False,

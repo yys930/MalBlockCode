@@ -353,9 +353,11 @@ def _compare_alert_coverage(exec_job: Dict[str, Any], baseline_job: Dict[str, An
 def _compare_summary_metrics(exec_eval: Dict[str, Any], baseline_eval: Dict[str, Any]) -> Dict[str, Any]:
     exec_execution = exec_eval.get("execution_eval") or {}
     baseline_execution = baseline_eval.get("execution_eval") or {}
+    exec_effective = _safe_int(exec_execution.get("effective_enforcement_count", exec_execution.get("new_enforcement_count")), 0)
+    baseline_effective = _safe_int(baseline_execution.get("effective_enforcement_count", baseline_execution.get("new_enforcement_count")), 0)
     return {
         "tool_success_count_delta": _safe_int(exec_execution.get("tool_success_count"), 0) - _safe_int(baseline_execution.get("tool_success_count"), 0),
-        "new_enforcement_count_delta": _safe_int(exec_execution.get("new_enforcement_count"), 0) - _safe_int(baseline_execution.get("new_enforcement_count"), 0),
+        "effective_enforcement_count_delta": exec_effective - baseline_effective,
         "repeat_enforcement_count_delta": _safe_int(exec_execution.get("repeat_enforcement_count"), 0) - _safe_int(baseline_execution.get("repeat_enforcement_count"), 0),
         "unique_blocked_ip_count_delta": _safe_int(exec_execution.get("unique_blocked_ip_count"), 0) - _safe_int(baseline_execution.get("unique_blocked_ip_count"), 0),
         "mean_suppression_ratio_delta": (

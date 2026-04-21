@@ -238,6 +238,61 @@ def _window_priority_key(item: Dict[str, Any] | CSVWindowCandidate) -> tuple[Any
     )
 
 
+def _sample_with_label_buckets(
+    candidates: List[CSVWindowCandidate],
+    quota: int,
+    rng: random.Random,
+) -> List[CSVWindowCandidate]:
+    if quota <= 0 or not candidates:
+        return []
+    if len(candidates) <= quota:
+        sampled = list(candidates)
+        rng.shuffle(sampled)
+        return sampled
+
+    buckets: Dict[str, List[CSVWindowCandidate]] = {}
+    for item in candidates:
+        buckets.setdefault(item.label or "UNKNOWN", []).append(item)
+
+    labels = sorted(buckets)
+    desired = {label: 0 for label in labels}
+    remaining = quota
+
+    shuffled_labels = labels[:]
+    rng.shuffle(shuffled_labels)
+    for label in shuffled_labels:
+        if remaining <= 0:
+            break
+        if buckets[label]:
+            desired[label] += 1
+            remaining -= 1
+
+    while remaining > 0:
+        expandable = [label for label in labels if len(buckets[label]) > desired[label]]
+        if not expandable:
+            break
+        rng.shuffle(expandable)
+        for label in expandable:
+            if remaining <= 0:
+                break
+            if len(buckets[label]) > desired[label]:
+                desired[label] += 1
+                remaining -= 1
+
+    sampled: List[CSVWindowCandidate] = []
+    for label in labels:
+        take = desired[label]
+        if take <= 0:
+            continue
+        group = buckets[label]
+        if len(group) <= take:
+            sampled.extend(group)
+        else:
+            sampled.extend(rng.sample(group, take))
+    rng.shuffle(sampled)
+    return sampled[:quota]
+
+
 def _sample_jsonl_windows(
     candidates: List[CSVWindowCandidate],
     topk: int,
@@ -263,58 +318,33 @@ def _sample_jsonl_windows(
     if selection_mode != "stratified_label":
         raise ValueError(f"unsupported selection_mode: {selection_mode}")
 
-    buckets: Dict[str, List[CSVWindowCandidate]] = {}
-    for item in eligible_items:
-        buckets.setdefault(item.label or "UNKNOWN", []).append(item)
-
-    labels = sorted(buckets)
     if effective_topk is None or len(eligible_items) <= effective_topk:
-        sampled = []
-        for label in labels:
-            group = list(buckets[label])
-            rng.shuffle(group)
-            sampled.extend(group)
+        sampled = list(eligible_items)
         rng.shuffle(sampled)
         return sampled
 
-    desired = {label: 0 for label in labels}
-    remaining = effective_topk
+    benign_candidates = [item for item in eligible_items if not item.label_is_malicious]
+    malicious_candidates = [item for item in eligible_items if item.label_is_malicious]
 
-    # First pass: guarantee as many labels as possible appear at least once.
-    shuffled_labels = labels[:]
-    rng.shuffle(shuffled_labels)
-    for label in shuffled_labels:
-        if remaining <= 0:
-            break
-        if buckets[label]:
-            desired[label] += 1
-            remaining -= 1
+    if benign_candidates and malicious_candidates:
+        benign_quota = min(len(benign_candidates), effective_topk // 2)
+        malicious_quota = min(len(malicious_candidates), effective_topk // 2)
+        sampled = _sample_with_label_buckets(benign_candidates, benign_quota, rng)
+        sampled.extend(_sample_with_label_buckets(malicious_candidates, malicious_quota, rng))
 
-    # Second pass: spread the rest roughly evenly across labels with remaining capacity.
-    while remaining > 0:
-        expandable = [label for label in labels if len(buckets[label]) > desired[label]]
-        if not expandable:
-            break
-        rng.shuffle(expandable)
-        for label in expandable:
-            if remaining <= 0:
-                break
-            if len(buckets[label]) > desired[label]:
-                desired[label] += 1
-                remaining -= 1
+        remaining = effective_topk - len(sampled)
+        if remaining > 0:
+            remaining_candidates = [
+                item
+                for item in eligible_items
+                if item not in sampled
+            ]
+            sampled.extend(_sample_with_label_buckets(remaining_candidates, remaining, rng))
 
-    sampled = []
-    for label in labels:
-        quota = desired[label]
-        if quota <= 0:
-            continue
-        group = buckets[label]
-        if len(group) <= quota:
-            sampled.extend(group)
-        else:
-            sampled.extend(rng.sample(group, quota))
-    rng.shuffle(sampled)
-    return sampled[:effective_topk]
+        rng.shuffle(sampled)
+        return sampled[:effective_topk]
+
+    return _sample_with_label_buckets(eligible_items, effective_topk, rng)
 
 
 def _load_windows_by_offsets(all_output: Path, candidates: List[CSVWindowCandidate]) -> List[Dict[str, Any]]:

@@ -12,6 +12,9 @@ from path_utils import resolve_project_path
 
 
 CSV_EVAL_KEY = Tuple[str, str, int, str, Tuple[str, ...], Tuple[int, ...], str]
+CSV_COMPACT_SOURCE = Tuple[str, str, str, str, str, str, bool]
+CSV_COMPACT_DECISION = Tuple[str, str, bool, bool, str, str, str]
+CSV_SOURCE_INDEX = Dict[CSV_EVAL_KEY, List[CSV_COMPACT_SOURCE]]
 ACTION_STRENGTH = {
     ("allow", "none"): 0,
     ("review", "none"): 0,
@@ -308,6 +311,115 @@ def _csv_eval_key_from_decision(decision: Dict[str, Any]) -> CSV_EVAL_KEY:
     )
 
 
+def _csv_eval_keys_from_decision(decision: Dict[str, Any]) -> List[CSV_EVAL_KEY]:
+    evidence = decision.get("evidence") or {}
+    flow_uid = str(evidence.get("flow_uid") or "")
+    if flow_uid:
+        return [("flow_uid", flow_uid, 0, "", tuple(), tuple(), "")]
+
+    src_ip = str(evidence.get("src_ip") or "")
+    window_start_iso = str(evidence.get("window_start_iso") or "")
+    src_port = int(evidence.get("src_port") or 0)
+    dst_ip = str(evidence.get("dst_ip") or "")
+    top_dest_ips = tuple(
+        str(entry.get("dest_ip") or "")
+        for entry in (evidence.get("top_dest_ips") or [])
+        if str(entry.get("dest_ip") or "")
+    )
+    dest_ports = tuple(
+        int(port)
+        for port in (evidence.get("dest_ports") or [])
+        if str(port).strip().isdigit()
+    )
+    top_signature = ""
+    top_signatures = evidence.get("top_signatures") or []
+    if top_signatures:
+        top_signature = str(top_signatures[0].get("signature") or "")
+
+    candidate_keys: List[CSV_EVAL_KEY] = []
+    seen = set()
+
+    def add(key: CSV_EVAL_KEY) -> None:
+        if key not in seen:
+            candidate_keys.append(key)
+            seen.add(key)
+
+    add((src_ip, window_start_iso, src_port, dst_ip, top_dest_ips, dest_ports, top_signature))
+
+    if src_ip and window_start_iso and top_signature:
+        if dst_ip:
+            add((src_ip, window_start_iso, 0, dst_ip, top_dest_ips, dest_ports, top_signature))
+        if src_port:
+            add((src_ip, window_start_iso, src_port, "", top_dest_ips, dest_ports, top_signature))
+        add((src_ip, window_start_iso, 0, "", top_dest_ips, dest_ports, top_signature))
+        if dest_ports:
+            add((src_ip, window_start_iso, 0, "", tuple(), dest_ports, top_signature))
+        add((src_ip, window_start_iso, 0, "", tuple(), tuple(), top_signature))
+
+    return candidate_keys
+
+
+def _find_csv_source_match(sources_by_key: CSV_SOURCE_INDEX, decision: Dict[str, Any]) -> CSV_COMPACT_SOURCE | None:
+    for key in _csv_eval_keys_from_decision(decision):
+        candidates = sources_by_key.get(key) or []
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
+def _distribution_with_unknown(counter: Counter, total: int) -> Dict[str, int]:
+    distribution = dict(counter)
+    known = sum(counter.values())
+    missing = max(0, total - known)
+    if missing:
+        distribution["unknown"] = distribution.get("unknown", 0) + missing
+    return distribution
+
+
+def _build_execution_eval_report(
+    *,
+    success_count: int,
+    failure_count: int,
+    new_enforcement_count: int,
+    repeat_enforcement_count: int,
+    consistency_count: int,
+    consistency_total: int,
+    decision_state_counter: Counter,
+    ttl_reason_counter: Counter,
+    decision_count: int,
+    already_present_count: int,
+    skipped_execution_count: int,
+    covered_by_existing_action_count: int,
+    unique_blocked_ips: set[str],
+    unique_rate_limited_ips: set[str],
+    unique_watched_ips: set[str],
+    failed_cases: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    repeat_ratio = repeat_enforcement_count / success_count if success_count else None
+    covered_ratio = covered_by_existing_action_count / success_count if success_count else None
+    skipped_ratio = skipped_execution_count / success_count if success_count else None
+    return {
+        "tool_success_count": success_count,
+        "tool_failure_count": failure_count,
+        "effective_enforcement_count": new_enforcement_count,
+        "new_enforcement_count": new_enforcement_count,
+        "repeat_enforcement_count": repeat_enforcement_count,
+        "decision_to_execution_consistency": _metric_ratio(consistency_count, consistency_total),
+        "decision_state_distribution": _distribution_with_unknown(decision_state_counter, decision_count),
+        "ttl_reason_distribution": _distribution_with_unknown(ttl_reason_counter, decision_count),
+        "already_present_count": already_present_count,
+        "skipped_execution_count": skipped_execution_count,
+        "covered_by_existing_action_count": covered_by_existing_action_count,
+        "repeat_enforcement_ratio": round(repeat_ratio, 6) if repeat_ratio is not None else None,
+        "covered_by_existing_action_ratio": round(covered_ratio, 6) if covered_ratio is not None else None,
+        "skipped_execution_ratio": round(skipped_ratio, 6) if skipped_ratio is not None else None,
+        "unique_blocked_ip_count": len(unique_blocked_ips),
+        "unique_rate_limited_ip_count": len(unique_rate_limited_ips),
+        "unique_watched_ip_count": len(unique_watched_ips),
+        "tool_failed_cases": failed_cases,
+    }
+
+
 def _collect_dataset_summary(channel: str, summary: Dict[str, Any], selected_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
     dataset_summary: Dict[str, Any] = {
         "input_rows": None,
@@ -337,7 +449,8 @@ def _collect_dataset_summary(channel: str, summary: Dict[str, Any], selected_inp
     label_counter = Counter()
     family_counter = Counter()
     source_day_counter = Counter()
-    flow_uids: List[str] = []
+    seen_flow_uids = set()
+    duplicate_input_count = 0
     for item in selected_inputs:
         features = item.get("csv_features") or {}
         label = str(features.get("label") or "")
@@ -351,14 +464,363 @@ def _collect_dataset_summary(channel: str, summary: Dict[str, Any], selected_inp
         if source_day:
             source_day_counter[source_day] += 1
         if flow_uid:
-            flow_uids.append(flow_uid)
+            if flow_uid in seen_flow_uids:
+                duplicate_input_count += 1
+            else:
+                seen_flow_uids.add(flow_uid)
 
     dataset_summary["label_distribution"] = dict(label_counter)
     dataset_summary["attack_family_distribution"] = dict(family_counter)
     dataset_summary["source_day_distribution"] = dict(source_day_counter)
-    dataset_summary["unique_flow_uid_count"] = len(set(flow_uids))
-    dataset_summary["duplicate_input_count"] = len(flow_uids) - len(set(flow_uids))
+    dataset_summary["unique_flow_uid_count"] = len(seen_flow_uids)
+    dataset_summary["duplicate_input_count"] = duplicate_input_count
     return dataset_summary
+
+
+def _collect_csv_inputs_streaming(summary: Dict[str, Any], selected_inputs_path: Path) -> tuple[Dict[str, Any], CSV_SOURCE_INDEX]:
+    csv_input = summary.get("csv_flow_input") or {}
+    label_counter = Counter()
+    family_counter = Counter()
+    source_day_counter = Counter()
+    unique_src_ips = set()
+    seen_flow_uids = set()
+    duplicate_input_count = 0
+    sources_by_key: CSV_SOURCE_INDEX = defaultdict(list)
+
+    if selected_inputs_path.exists():
+        for item in iter_jsonl(str(selected_inputs_path)):
+            features = item.get("csv_features") or {}
+            label = str(features.get("label") or "")
+            family = str(features.get("attack_family") or "")
+            source_day = str(features.get("source_day") or item.get("source_day") or "")
+            flow_uid = str(features.get("flow_uid") or item.get("flow_uid") or "")
+            src_ip = str(item.get("src_ip") or "")
+            window_start_iso = str(item.get("window_start_iso") or "")
+            label_is_malicious = bool(features.get("label_is_malicious"))
+            source_record = (
+                flow_uid,
+                src_ip,
+                window_start_iso,
+                label,
+                family,
+                source_day,
+                label_is_malicious,
+            )
+
+            if label:
+                label_counter[label] += 1
+            if family:
+                family_counter[family] += 1
+            if source_day:
+                source_day_counter[source_day] += 1
+            if src_ip:
+                unique_src_ips.add(src_ip)
+            if flow_uid:
+                if flow_uid in seen_flow_uids:
+                    duplicate_input_count += 1
+                else:
+                    seen_flow_uids.add(flow_uid)
+
+            primary_key = _csv_eval_key_from_input(item)
+            sources_by_key[primary_key].append(source_record)
+
+            top_dest_ips = tuple(
+                str(entry.get("dest_ip") or "")
+                for entry in (item.get("top_dest_ips") or [])
+                if str(entry.get("dest_ip") or "")
+            )
+            dest_ports = tuple(
+                int(port)
+                for port in (item.get("dest_ports") or [])
+                if str(port).strip().isdigit()
+            )
+            top_signature = ""
+            top_signatures = item.get("top_signatures") or []
+            if top_signatures:
+                top_signature = str(top_signatures[0].get("signature") or "")
+            src_port = int(features.get("src_port") or item.get("src_port") or 0)
+            dst_ip = str(features.get("dst_ip") or item.get("dst_ip") or "")
+            src_key = src_ip
+            time_key = window_start_iso
+            if src_key and time_key and top_signature:
+                fallback_keys = [
+                    (src_key, time_key, src_port, dst_ip, top_dest_ips, dest_ports, top_signature),
+                    (src_key, time_key, 0, dst_ip, top_dest_ips, dest_ports, top_signature),
+                    (src_key, time_key, src_port, "", top_dest_ips, dest_ports, top_signature),
+                    (src_key, time_key, 0, "", top_dest_ips, dest_ports, top_signature),
+                    (src_key, time_key, 0, "", tuple(), dest_ports, top_signature),
+                    (src_key, time_key, 0, "", tuple(), tuple(), top_signature),
+                ]
+                seen_fallbacks = {primary_key}
+                for fallback_key in fallback_keys:
+                    if fallback_key not in seen_fallbacks:
+                        sources_by_key[fallback_key].append(source_record)
+                        seen_fallbacks.add(fallback_key)
+
+    dataset_summary: Dict[str, Any] = {
+        "input_rows": csv_input.get("total_rows"),
+        "selected_rows": csv_input.get("selected_rows", len(sources_by_key)),
+        "malicious_rows": csv_input.get("malicious_rows"),
+        "benign_rows": csv_input.get("benign_rows"),
+        "label_distribution": dict(label_counter),
+        "attack_family_distribution": dict(family_counter),
+        "source_day_distribution": dict(source_day_counter),
+        "unique_src_ip_count": len(unique_src_ips),
+        "unique_flow_uid_count": len(seen_flow_uids),
+        "duplicate_input_count": duplicate_input_count,
+    }
+    return dataset_summary, sources_by_key
+
+
+def _compact_csv_decision(decision: Dict[str, Any]) -> CSV_COMPACT_DECISION:
+    evidence = decision.get("evidence") or {}
+    return (
+        str(decision.get("action") or ""),
+        str((decision.get("strategy") or {}).get("execution_mode") or ""),
+        bool((decision.get("tool_result") or {}).get("ok")),
+        bool((decision.get("tool_result") or {}).get("already_present")),
+        str(evidence.get("flow_uid") or ""),
+        str(evidence.get("src_ip") or ""),
+        str(evidence.get("window_start_iso") or ""),
+    )
+
+
+def _evaluate_csv_job_streaming(job_dir: Path, summary: Dict[str, Any]) -> Dict[str, Any]:
+    decisions_path = job_dir / "llm_decisions.jsonl"
+    selected_inputs_path = job_dir / "llm_inputs_selected.jsonl"
+    dataset_summary, sources_by_key = _collect_csv_inputs_streaming(summary, selected_inputs_path)
+
+    decision_count = 0
+    action_counter = Counter()
+    execution_mode_counter = Counter()
+    success_count = 0
+    failure_count = 0
+    already_present_count = 0
+    skipped_execution_count = 0
+    covered_by_existing_action_count = 0
+    new_enforcement_count = 0
+    repeat_enforcement_count = 0
+    consistency_count = 0
+    consistency_total = 0
+    unique_blocked_ips = set()
+    unique_rate_limited_ips = set()
+    unique_watched_ips = set()
+    decision_state_counter = Counter()
+    ttl_reason_counter = Counter()
+    failed_cases = []
+
+    strong_tp = strong_fp = strong_tn = strong_fn = 0
+    risk_tp = risk_fp = risk_tn = risk_fn = 0
+    matched = 0
+    per_label: Dict[str, Counter] = defaultdict(Counter)
+    per_family: Dict[str, Counter] = defaultdict(Counter)
+    per_source_day: Dict[str, Counter] = defaultdict(Counter)
+    sample_rows = []
+    strong_fp_cases = []
+    strong_fn_cases = []
+    review_cases = []
+    unmatched_cases = []
+
+    for decision in iter_jsonl(str(decisions_path)):
+        decision_count += 1
+        action = str(decision.get("action") or "unknown")
+        execution_mode = str((decision.get("strategy") or {}).get("execution_mode") or "none")
+        action_counter[action] += 1
+        execution_mode_counter[execution_mode] += 1
+
+        tool_result = decision.get("tool_result") or {}
+        tool_action = str(tool_result.get("action") or "")
+        ip = str(tool_result.get("ip") or "")
+        ok = bool(tool_result.get("ok"))
+        decision_state = str(decision.get("decision_state") or "")
+        ttl_reason = str(decision.get("ttl_reason") or "")
+        already_present = bool(tool_result.get("already_present"))
+        skipped_execution = bool(tool_result.get("skipped_execution"))
+        covered_by_existing_action = bool(tool_result.get("covered_by_existing_action"))
+
+        if decision_state:
+            decision_state_counter[decision_state] += 1
+        if ttl_reason:
+            ttl_reason_counter[ttl_reason] += 1
+
+        expected_tool = _expected_tool_name(action, execution_mode)
+        if expected_tool is not None or tool_result:
+            consistency_total += 1
+            if _decision_execution_consistent(decision):
+                consistency_count += 1
+
+        if ok:
+            success_count += 1
+        elif tool_result:
+            failure_count += 1
+
+        if already_present:
+            already_present_count += 1
+        if skipped_execution:
+            skipped_execution_count += 1
+        if covered_by_existing_action:
+            covered_by_existing_action_count += 1
+
+        if ok and not already_present and not skipped_execution and not covered_by_existing_action:
+            new_enforcement_count += 1
+        if ok and (already_present or skipped_execution or covered_by_existing_action):
+            repeat_enforcement_count += 1
+
+        if ok and ip:
+            if tool_action == "block_ip":
+                unique_blocked_ips.add(ip)
+            elif tool_action == "rate_limit_ip":
+                unique_rate_limited_ips.add(ip)
+            elif tool_action == "watch_ip":
+                unique_watched_ips.add(ip)
+
+        if tool_result and not ok and len(failed_cases) < 20:
+            failed_cases.append(
+                {
+                    "target_ip": str((decision.get("target") or {}).get("value") or ""),
+                    "action": decision.get("action"),
+                    "execution_mode": execution_mode,
+                    "tool_action": tool_action,
+                    "error": tool_result.get("error") or tool_result.get("stderr"),
+                }
+            )
+
+        source = _find_csv_source_match(sources_by_key, decision)
+        if not source:
+            if len(unmatched_cases) < 20:
+                evidence = decision.get("evidence") or {}
+                unmatched_cases.append(
+                    {
+                        "flow_uid": evidence.get("flow_uid"),
+                        "src_ip": evidence.get("src_ip"),
+                        "window_start_iso": evidence.get("window_start_iso"),
+                        "action": action,
+                        "execution_mode": execution_mode,
+                    }
+                )
+            continue
+
+        matched += 1
+        flow_uid, src_ip, window_start_iso, label, family, source_day, label_is_malicious = source
+        strong_positive = action == "block"
+        risk_positive = action in {"block", "monitor", "review"}
+
+        if strong_positive and label_is_malicious:
+            strong_tp += 1
+            outcome = "tp"
+        elif strong_positive and not label_is_malicious:
+            strong_fp += 1
+            outcome = "fp"
+        elif not strong_positive and label_is_malicious:
+            strong_fn += 1
+            outcome = "fn"
+        else:
+            strong_tn += 1
+            outcome = "tn"
+
+        if risk_positive and label_is_malicious:
+            risk_tp += 1
+        elif risk_positive and not label_is_malicious:
+            risk_fp += 1
+        elif not risk_positive and label_is_malicious:
+            risk_fn += 1
+        else:
+            risk_tn += 1
+
+        for bucket_key, bucket in ((label, per_label), (family, per_family), (source_day, per_source_day)):
+            if bucket_key:
+                bucket[bucket_key][outcome] += 1
+
+        row_summary = {
+            "flow_uid": flow_uid,
+            "src_ip": src_ip,
+            "window_start_iso": window_start_iso,
+            "label": label,
+            "attack_family": family,
+            "source_day": source_day,
+            "action": action,
+            "execution_mode": execution_mode,
+            "tool_ok": ok,
+            "already_present": already_present,
+        }
+        if len(sample_rows) < 100:
+            sample_rows.append(row_summary)
+        if outcome == "fp" and len(strong_fp_cases) < 20:
+            strong_fp_cases.append(row_summary)
+        if outcome == "fn" and len(strong_fn_cases) < 20:
+            strong_fn_cases.append(row_summary)
+        if action == "review" and len(review_cases) < 20:
+            review_cases.append(row_summary)
+
+    unmatched_decisions = decision_count - matched
+    strong_metrics = _binary_metrics(strong_tp, strong_fp, strong_tn, strong_fn)
+    risk_metrics = _binary_metrics(risk_tp, risk_fp, risk_tn, risk_fn)
+
+    report: Dict[str, Any] = {
+        "job_meta": {
+            "channel": "csv_flow",
+            "job_id": summary.get("job_id"),
+            "job_dir": str(job_dir),
+            "source_path": summary.get("source_path"),
+        },
+        "dataset_summary": dataset_summary,
+        "decision_eval": {
+            "decision_count": decision_count,
+            "action_distribution": dict(action_counter),
+            "execution_mode_distribution": dict(execution_mode_counter),
+            "risk_detection_metrics": {
+                **risk_metrics,
+                "positive_actions": ["block", "monitor", "review"],
+            },
+            "strong_mitigation_metrics": {
+                **strong_metrics,
+                "positive_actions": ["block"],
+            },
+            "csv_metrics": {
+                **strong_metrics,
+                "matched_decisions": matched,
+                "unmatched_decisions": unmatched_decisions,
+                "per_label_metrics": _metric_counter_to_report(per_label),
+                "per_attack_family_metrics": _metric_counter_to_report(per_family),
+                "per_source_day_metrics": _metric_counter_to_report(per_source_day),
+            },
+        },
+        "execution_eval": _build_execution_eval_report(
+            success_count=success_count,
+            failure_count=failure_count,
+            new_enforcement_count=new_enforcement_count,
+            repeat_enforcement_count=repeat_enforcement_count,
+            consistency_count=consistency_count,
+            consistency_total=consistency_total,
+            decision_state_counter=decision_state_counter,
+            ttl_reason_counter=ttl_reason_counter,
+            decision_count=decision_count,
+            already_present_count=already_present_count,
+            skipped_execution_count=skipped_execution_count,
+            covered_by_existing_action_count=covered_by_existing_action_count,
+            unique_blocked_ips=unique_blocked_ips,
+            unique_rate_limited_ips=unique_rate_limited_ips,
+            unique_watched_ips=unique_watched_ips,
+            failed_cases=failed_cases,
+        ),
+        "error_analysis": {
+            "false_positive_cases": strong_fp_cases,
+            "false_negative_cases": strong_fn_cases,
+            "review_cases": review_cases,
+            "unmatched_cases": unmatched_cases,
+            "tool_failed_cases": failed_cases,
+        },
+        "samples": {
+            "decision_samples": sample_rows[:20],
+        },
+        "effect_eval": {
+            "applicable": False,
+            "metric_semantics": "proxy",
+            "proxy_metric_name": PROXY_METRIC_NAME,
+            "reason": "csv_flow is a structured-flow decision evaluation channel, not a live or replay mitigation-effect channel.",
+        },
+    }
+    return report
 
 
 def _expected_tool_name(action: str, execution_mode: str) -> str | None:
@@ -462,29 +924,24 @@ def _collect_execution_eval(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
                 }
             )
 
-    repeat_ratio = already_present_count / success_count if success_count else None
-    covered_ratio = covered_by_existing_action_count / success_count if success_count else None
-    skipped_ratio = skipped_execution_count / success_count if success_count else None
-    return {
-        "tool_success_count": success_count,
-        "tool_failure_count": failure_count,
-        "effective_enforcement_count": success_count,
-        "new_enforcement_count": new_enforcement_count,
-        "repeat_enforcement_count": repeat_enforcement_count,
-        "decision_to_execution_consistency": _metric_ratio(consistency_count, consistency_total),
-        "decision_state_distribution": dict(decision_state_counter),
-        "ttl_reason_distribution": dict(ttl_reason_counter),
-        "already_present_count": already_present_count,
-        "skipped_execution_count": skipped_execution_count,
-        "covered_by_existing_action_count": covered_by_existing_action_count,
-        "repeat_enforcement_ratio": round(repeat_ratio, 6) if repeat_ratio is not None else None,
-        "covered_by_existing_action_ratio": round(covered_ratio, 6) if covered_ratio is not None else None,
-        "skipped_execution_ratio": round(skipped_ratio, 6) if skipped_ratio is not None else None,
-        "unique_blocked_ip_count": len(unique_blocked_ips),
-        "unique_rate_limited_ip_count": len(unique_rate_limited_ips),
-        "unique_watched_ip_count": len(unique_watched_ips),
-        "tool_failed_cases": failed_cases,
-    }
+    return _build_execution_eval_report(
+        success_count=success_count,
+        failure_count=failure_count,
+        new_enforcement_count=new_enforcement_count,
+        repeat_enforcement_count=repeat_enforcement_count,
+        consistency_count=consistency_count,
+        consistency_total=consistency_total,
+        decision_state_counter=decision_state_counter,
+        ttl_reason_counter=ttl_reason_counter,
+        decision_count=len(decisions),
+        already_present_count=already_present_count,
+        skipped_execution_count=skipped_execution_count,
+        covered_by_existing_action_count=covered_by_existing_action_count,
+        unique_blocked_ips=unique_blocked_ips,
+        unique_rate_limited_ips=unique_rate_limited_ips,
+        unique_watched_ips=unique_watched_ips,
+        failed_cases=failed_cases,
+    )
 
 
 def _top_signatures_from_evidence(evidence: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -833,9 +1290,44 @@ def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregate
 
 
 def _evaluate_csv_channel(decisions: List[Dict[str, Any]], selected_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    inputs_by_key: Dict[CSV_EVAL_KEY, Dict[str, Any]] = {}
+    inputs_by_key: Dict[CSV_EVAL_KEY, List[Dict[str, Any]]] = defaultdict(list)
     for item in selected_inputs:
-        inputs_by_key[_csv_eval_key_from_input(item)] = item
+        primary_key = _csv_eval_key_from_input(item)
+        inputs_by_key[primary_key].append(item)
+
+        features = item.get("csv_features") or {}
+        top_dest_ips = tuple(
+            str(entry.get("dest_ip") or "")
+            for entry in (item.get("top_dest_ips") or [])
+            if str(entry.get("dest_ip") or "")
+        )
+        dest_ports = tuple(
+            int(port)
+            for port in (item.get("dest_ports") or [])
+            if str(port).strip().isdigit()
+        )
+        top_signature = ""
+        top_signatures = item.get("top_signatures") or []
+        if top_signatures:
+            top_signature = str(top_signatures[0].get("signature") or "")
+        src_key = str(item.get("src_ip") or "")
+        time_key = str(item.get("window_start_iso") or "")
+        src_port = int(features.get("src_port") or item.get("src_port") or 0)
+        dst_ip = str(features.get("dst_ip") or item.get("dst_ip") or "")
+        if src_key and time_key and top_signature:
+            fallback_keys = [
+                (src_key, time_key, src_port, dst_ip, top_dest_ips, dest_ports, top_signature),
+                (src_key, time_key, 0, dst_ip, top_dest_ips, dest_ports, top_signature),
+                (src_key, time_key, src_port, "", top_dest_ips, dest_ports, top_signature),
+                (src_key, time_key, 0, "", top_dest_ips, dest_ports, top_signature),
+                (src_key, time_key, 0, "", tuple(), dest_ports, top_signature),
+                (src_key, time_key, 0, "", tuple(), tuple(), top_signature),
+            ]
+            seen_fallbacks = {primary_key}
+            for fallback_key in fallback_keys:
+                if fallback_key not in seen_fallbacks:
+                    inputs_by_key[fallback_key].append(item)
+                    seen_fallbacks.add(fallback_key)
 
     strong_tp = strong_fp = strong_tn = strong_fn = 0
     risk_tp = risk_fp = risk_tn = risk_fn = 0
@@ -851,8 +1343,12 @@ def _evaluate_csv_channel(decisions: List[Dict[str, Any]], selected_inputs: List
     unmatched_cases = []
 
     for decision in decisions:
-        key = _csv_eval_key_from_decision(decision)
-        source = inputs_by_key.get(key)
+        source = None
+        for key in _csv_eval_keys_from_decision(decision):
+            candidates = inputs_by_key.get(key) or []
+            if len(candidates) == 1:
+                source = candidates[0]
+                break
         action = str(decision.get("action") or "")
         execution_mode = str((decision.get("strategy") or {}).get("execution_mode") or "")
         if not source:
@@ -1052,52 +1548,33 @@ def evaluate_job(job_dir: str | Path) -> Dict[str, Any]:
     job_dir = resolve_project_path(job_dir)
     summary = _load_channel_summary(job_dir)
     channel = str(summary.get("channel") or "unknown")
-    decisions = list(iter_jsonl(str(job_dir / "llm_decisions.jsonl")))
-    selected_inputs = list(iter_jsonl(str(job_dir / "llm_inputs_selected.jsonl"))) if (job_dir / "llm_inputs_selected.jsonl").exists() else []
-    all_inputs = list(iter_jsonl(str(job_dir / "llm_inputs_all.jsonl"))) if (job_dir / "llm_inputs_all.jsonl").exists() else selected_inputs
-
-    report: Dict[str, Any] = {
-        "job_meta": {
-            "channel": channel,
-            "job_id": summary.get("job_id"),
-            "job_dir": str(job_dir),
-            "source_path": summary.get("source_path"),
-        },
-        "dataset_summary": _collect_dataset_summary(channel, summary, selected_inputs),
-        "decision_eval": {
-            "decision_count": len(decisions),
-            "action_distribution": _action_distribution(decisions),
-            "execution_mode_distribution": _strategy_distribution(decisions),
-        },
-        "strategy_eval": _evaluate_strategy_eval(channel, decisions, selected_inputs),
-        "execution_eval": _collect_execution_eval(decisions),
-        "safety_eval": _evaluate_safety(decisions),
-    }
 
     if channel == "csv_flow":
-        csv_eval = _evaluate_csv_channel(decisions, selected_inputs)
-        report["decision_eval"]["risk_detection_metrics"] = csv_eval["risk_detection_metrics"]
-        report["decision_eval"]["strong_mitigation_metrics"] = csv_eval["strong_mitigation_metrics"]
-        report["decision_eval"]["csv_metrics"] = csv_eval["legacy_csv_metrics"]
-        report["error_analysis"] = {
-            **csv_eval["error_analysis"],
-            "strategy_mismatch_cases": report["strategy_eval"].get("mismatch_cases", []),
-            "constraint_violation_cases": report["safety_eval"]["constraint_violation_cases"],
-            "tool_failed_cases": report["execution_eval"]["tool_failed_cases"],
-        }
-        report["samples"] = {"decision_samples": csv_eval["sample_rows"][:20]}
-        report["effect_eval"] = {
-            "applicable": False,
-            "metric_semantics": "proxy",
-            "proxy_metric_name": PROXY_METRIC_NAME,
-            "reason": "csv_flow is a structured-flow decision evaluation channel, not a live or replay mitigation-effect channel.",
-        }
+        report = _evaluate_csv_job_streaming(job_dir, summary)
     else:
+        decisions = list(iter_jsonl(str(job_dir / "llm_decisions.jsonl")))
+        selected_inputs = list(iter_jsonl(str(job_dir / "llm_inputs_selected.jsonl"))) if (job_dir / "llm_inputs_selected.jsonl").exists() else []
+
+        report = {
+            "job_meta": {
+                "channel": channel,
+                "job_id": summary.get("job_id"),
+                "job_dir": str(job_dir),
+                "source_path": summary.get("source_path"),
+            },
+            "dataset_summary": _collect_dataset_summary(channel, summary, selected_inputs),
+            "decision_eval": {
+                "decision_count": len(decisions),
+                "action_distribution": _action_distribution(decisions),
+                "execution_mode_distribution": _strategy_distribution(decisions),
+            },
+            "execution_eval": _collect_execution_eval(decisions),
+        }
+
+        all_inputs = list(iter_jsonl(str(job_dir / "llm_inputs_all.jsonl"))) if (job_dir / "llm_inputs_all.jsonl").exists() else selected_inputs
         suppression_eval = _evaluate_alert_suppression_proxy(decisions, all_inputs)
         report["effect_eval"] = suppression_eval
         report["error_analysis"] = {
-            "strategy_mismatch_cases": report["strategy_eval"].get("mismatch_cases", []),
-            "constraint_violation_cases": report["safety_eval"]["constraint_violation_cases"],
             "tool_failed_cases": report["execution_eval"]["tool_failed_cases"],
         }
         report["samples"] = {"suppression_samples": suppression_eval.get("per_decision", [])[:20]}

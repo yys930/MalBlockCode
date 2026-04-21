@@ -156,6 +156,36 @@ class RAGStoreTests(unittest.TestCase):
             self.assertEqual(retrieved[0]["retrieval_method"], "archive_fallback")
             self.assertGreaterEqual(float(retrieved[0]["similarity"]), 0.2)
 
+    def test_retrieve_evidence_keeps_pending_archive_cases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            archive_path = tmp_path / "decision_history.jsonl"
+            archive_cases = [
+                _build_case(
+                    "pending-scan-case",
+                    "scan",
+                    "ET SCAN Nmap Scripting Engine User-Agent Detected",
+                    feedback_status="pending_evaluation",
+                )
+            ]
+            with archive_path.open("w", encoding="utf-8") as f:
+                for case in archive_cases:
+                    f.write(json.dumps(case, ensure_ascii=False) + "\n")
+
+            cfg = VectorRAGConfig(
+                db_dir=str(tmp_path / "missing_chroma_db"),
+                archive_path=str(archive_path),
+                enable_archive_fallback=True,
+                archive_fallback_min_score=0.2,
+                archive_scan_limit=100,
+            )
+
+            retrieved = retrieve_evidence(_build_message(), cfg, top_k=1)
+
+            self.assertEqual(len(retrieved), 1)
+            self.assertEqual(retrieved[0]["window_key"], "pending-scan-case")
+            self.assertEqual(retrieved[0]["strategy_summary"]["status"], "pending_evaluation")
+
     def test_append_rag_case_keeps_archive_even_if_vector_upsert_fails(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -195,6 +225,7 @@ class RAGStoreTests(unittest.TestCase):
             stored = json.loads(lines[0])
             self.assertEqual(stored["job_id"], "job_rag_test")
             self.assertEqual(stored["historical_strategy"]["action"], "block")
+            self.assertNotIn("feedback", stored)
 
 
 if __name__ == "__main__":

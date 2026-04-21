@@ -1,4 +1,5 @@
 # backend/agent/message_builder.py
+import copy
 import ipaddress
 from typing import Any, Dict, List, Tuple
 
@@ -194,12 +195,16 @@ def build_message(window: Dict[str, Any], retrieved_evidence: List[Dict[str, Any
     message = {task, constraints, hints, window}
     你会把这个 JSON 作为 user message content 给 LLM
     """
-    compacted_window = compact_window(window)
+    llm_window = copy.deepcopy(window)
+    csv_features = llm_window.get("csv_features")
+    if isinstance(csv_features, dict):
+        csv_features.pop("label_is_malicious", None)
+    compacted_window = compact_window(llm_window)
     return {
         "task": "decide_mitigation",
         "constraints": get_constraints(),
-        "hints": build_hints(window),
+        "hints": build_hints(llm_window),
         "window": compacted_window,
-        "evidence_window": window,
+        "evidence_window": llm_window,
         "retrieved_evidence": retrieved_evidence or [],
     }

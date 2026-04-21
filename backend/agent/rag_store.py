@@ -18,7 +18,6 @@ class VectorRAGConfig:
     embedding_api_key: str = ""
     embedding_base_url: str = "https://api.openai.com/v1"
     min_similarity: float = 0.45
-    include_pending_feedback: bool = False
     enable_archive_fallback: bool = True
     archive_fallback_min_score: float = 0.2
     archive_scan_limit: int = 2000
@@ -41,7 +40,6 @@ def default_rag_config() -> VectorRAGConfig:
             os.environ.get("SILICONFLOW_BASE_URL", "https://api.siliconflow.cn/v1"),
         ),
         min_similarity=float(os.environ.get("RAG_MIN_SIMILARITY", "0.45")),
-        include_pending_feedback=os.environ.get("RAG_INCLUDE_PENDING_FEEDBACK", "0") == "1",
         enable_archive_fallback=os.environ.get("RAG_ENABLE_ARCHIVE_FALLBACK", "1") != "0",
         archive_fallback_min_score=float(os.environ.get("RAG_ARCHIVE_FALLBACK_MIN_SCORE", "0.2")),
         archive_scan_limit=max(1, int(os.environ.get("RAG_ARCHIVE_SCAN_LIMIT", "2000"))),
@@ -78,32 +76,13 @@ def _warn(message: str) -> None:
     print(f"[rag] {message}", file=sys.stderr)
 
 
-def _build_feedback_stub(decision: Dict[str, Any]) -> Dict[str, Any]:
-    action = decision.get("action")
-    tool_result = decision.get("tool_result") or {}
-
-    return {
-        "status": "pending_evaluation",
-        "is_effective": None,
-        "false_positive": None,
-        "alert_drop_ratio": None,
-        "notes": [],
-        "execution_status": (
-            "executed"
-            if action == "block" and tool_result.get("ok")
-            else "not_executed"
-        ),
-    }
-
-
 def build_rag_case(message: Dict[str, Any], decision: Dict[str, Any], feedback: Dict[str, Any] | None = None) -> Dict[str, Any]:
     window = message.get("evidence_window", message.get("window", {}))
     hints = message.get("hints", {})
     meta = message.get("meta", {})
     retrieved = message.get("retrieved_evidence", [])
-    feedback = feedback or _build_feedback_stub(decision)
 
-    return {
+    case = {
         "case_version": 3,
         "case_id": meta.get("window_key") or f'{window.get("src_ip")}:{window.get("window_start_epoch")}-{window.get("window_end_epoch")}',
         "window_key": meta.get("window_key"),
@@ -133,12 +112,14 @@ def build_rag_case(message: Dict[str, Any], decision: Dict[str, Any], feedback: 
             "strategy": decision.get("strategy", {}),
         },
         "execution_result": decision.get("tool_result"),
-        "feedback": feedback,
         "retrieval_context": {
             "used_history_count": len(retrieved),
             "source_window_key": meta.get("window_key"),
         },
     }
+    if feedback is not None:
+        case["feedback"] = feedback
+    return case
 
 
 def _top_signatures_text(window: Dict[str, Any]) -> str:
@@ -212,13 +193,6 @@ def _query_to_text(message: Dict[str, Any]) -> str:
             "Task: retrieve historical decision cases that can guide mitigation strategy before current LLM decision.",
         ]
     )
-
-
-def _case_feedback_allowed(case: Dict[str, Any], cfg: VectorRAGConfig) -> bool:
-    feedback = case.get("feedback", {})
-    if not cfg.include_pending_feedback and feedback.get("status") == "pending_evaluation":
-        return False
-    return True
 
 
 def _case_to_retrieved_entry(
@@ -357,7 +331,7 @@ def _query_archive_cases(message: Dict[str, Any], cfg: VectorRAGConfig, top_k: i
 
     ranked: List[Tuple[float, Dict[str, Any]]] = []
     for case in all_cases:
-        if not isinstance(case, dict) or not _case_feedback_allowed(case, cfg):
+        if not isinstance(case, dict):
             continue
         score = _archive_match_score(message, case)
         if score < cfg.archive_fallback_min_score:
@@ -471,8 +445,6 @@ class VectorRAGStore:
                 continue
 
             strategy = case.get("historical_strategy", {})
-            if not _case_feedback_allowed(case, self.cfg):
-                continue
             distance = distances[idx] if idx < len(distances) else None
             similarity = None if distance is None else round(1.0 / (1.0 + float(distance)), 6)
             if similarity is not None and similarity < self.cfg.min_similarity:
