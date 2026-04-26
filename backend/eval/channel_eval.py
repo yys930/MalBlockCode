@@ -1233,6 +1233,29 @@ def _evaluate_strategy_eval(
     }
 
 
+REPLAY_NOISE_SIGNATURE_KEYWORDS = (
+    "packet out of window",
+    "invalid timestamp",
+    "wrong ack",
+    "bad window update",
+)
+
+
+def _window_noise_hit_breakdown(window: Dict[str, Any]) -> Dict[str, int]:
+    total_hits = _safe_int(window.get("hits"), 0)
+    noise_hits = 0
+    for item in _top_signatures_from_evidence(window):
+        signature = str(item.get("signature") or "").lower()
+        if any(keyword in signature for keyword in REPLAY_NOISE_SIGNATURE_KEYWORDS):
+            noise_hits += _safe_int(item.get("count"), 0)
+    noise_hits = min(noise_hits, total_hits)
+    return {
+        "total_hits": total_hits,
+        "noise_hits": noise_hits,
+        "effective_hits": max(0, total_hits - noise_hits),
+    }
+
+
 def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregated_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
     windows_by_src: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for item in aggregated_inputs:
@@ -1242,6 +1265,8 @@ def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregate
 
     per_decision = []
     ratios: List[float] = []
+    excluded_noise_cases = 0
+    excluded_noise_hit_count = 0
     for decision in decisions:
         strategy = decision.get("strategy") or {}
         execution_mode = str(strategy.get("execution_mode") or "")
@@ -1252,21 +1277,35 @@ def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregate
         start_iso = evidence.get("window_start_iso")
         ttl_sec = _safe_int(decision.get("ttl_sec"), 0)
         windows = windows_by_src.get(src_ip, [])
-        before_hits = _safe_int(evidence.get("hits"), 0)
         decision_start = None
+        decision_window = None
         for window in windows:
             if window.get("window_start_iso") == start_iso:
                 decision_start = _safe_int(window.get("window_start_epoch"), 0)
+                decision_window = window
                 break
-        if decision_start is None:
+        if decision_start is None or decision_window is None:
             continue
+
+        before_breakdown = _window_noise_hit_breakdown(decision_window)
+        before_hits_raw = before_breakdown["total_hits"]
+        before_hits = before_breakdown["effective_hits"]
+        excluded_noise_hit_count += before_breakdown["noise_hits"]
+        if before_hits <= 0:
+            excluded_noise_cases += 1
+            continue
+
+        after_hits_raw = 0
         after_hits = 0
         cutoff = decision_start + max(1, ttl_sec)
         for window in windows:
             start_epoch = _safe_int(window.get("window_start_epoch"), 0)
             if decision_start < start_epoch <= cutoff:
-                after_hits += _safe_int(window.get("hits"), 0)
-        ratio = 1.0 if before_hits <= 0 else round(max(0.0, 1.0 - (after_hits / before_hits)), 6)
+                after_breakdown = _window_noise_hit_breakdown(window)
+                after_hits_raw += after_breakdown["total_hits"]
+                after_hits += after_breakdown["effective_hits"]
+                excluded_noise_hit_count += after_breakdown["noise_hits"]
+        ratio = round(max(0.0, 1.0 - (after_hits / before_hits)), 6)
         ratios.append(ratio)
         per_decision.append(
             {
@@ -1274,7 +1313,10 @@ def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregate
                 "decision_window_start_iso": start_iso,
                 "execution_mode": execution_mode,
                 "before_hits": before_hits,
+                "before_hits_raw": before_hits_raw,
                 "after_hits_within_ttl": after_hits,
+                "after_hits_within_ttl_raw": after_hits_raw,
+                "excluded_noise_hits": before_breakdown["noise_hits"] + max(0, after_hits_raw - after_hits),
                 "suppression_ratio": ratio,
             }
         )
@@ -1283,6 +1325,10 @@ def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregate
         "applicable": True,
         "metric_semantics": "proxy",
         "proxy_metric_name": PROXY_METRIC_NAME,
+        "noise_filtered": True,
+        "noise_signature_keywords": list(REPLAY_NOISE_SIGNATURE_KEYWORDS),
+        "excluded_noise_cases": excluded_noise_cases,
+        "excluded_noise_hit_count": excluded_noise_hit_count,
         "evaluated_decisions": len(per_decision),
         "mean_suppression_ratio": round(sum(ratios) / len(ratios), 6) if ratios else None,
         "per_decision": per_decision[:100],

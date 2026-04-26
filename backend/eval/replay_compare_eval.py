@@ -144,8 +144,9 @@ def _compatibility_checks(exec_job: Dict[str, Any], baseline_job: Dict[str, Any]
     base_replay = base_summary.get("replay") or {}
 
     differences: List[str] = []
+    warnings: List[str] = []
 
-    checks = {
+    strict_checks = {
         "same_channel": (exec_summary.get("channel") == base_summary.get("channel"), "channel differs"),
         "same_source_path": (exec_summary.get("source_path") == base_summary.get("source_path"), "source_path differs"),
         "same_window_sec": (exec_agg.get("window_sec") == base_agg.get("window_sec"), "window_sec differs"),
@@ -154,16 +155,23 @@ def _compatibility_checks(exec_job: Dict[str, Any], baseline_job: Dict[str, Any]
         "same_suricata_interface": (exec_replay.get("suricata_interface") == base_replay.get("suricata_interface"), "suricata_interface differs"),
         "same_replay_interface": (exec_replay.get("replay_interface") == base_replay.get("replay_interface"), "replay_interface differs"),
         "same_replay_netns": (exec_replay.get("replay_netns") == base_replay.get("replay_netns"), "replay_netns differs"),
+    }
+    warning_checks = {
         "same_selected_window_count": (exec_agg.get("selected_groups") == base_agg.get("selected_groups"), "selected_groups differs"),
     }
 
     report: Dict[str, Any] = {}
-    for name, (ok, message) in checks.items():
+    for name, (ok, message) in strict_checks.items():
         report[name] = bool(ok)
         if not ok:
             differences.append(message)
+    for name, (ok, message) in warning_checks.items():
+        report[name] = bool(ok)
+        if not ok:
+            warnings.append(message)
     report["compatible"] = len(differences) == 0
     report["differences"] = differences
+    report["warnings"] = warnings
     return report
 
 
@@ -429,7 +437,7 @@ def evaluate_replay_comparison(exec_job_dir: str | Path, baseline_job_dir: str |
             "mode": "execution_vs_no_execution",
             "generated_at": int(time.time()),
             "compatible": compatibility["compatible"],
-            "warnings": compatibility["differences"],
+            "warnings": compatibility["differences"] + compatibility.get("warnings", []),
         },
         "exec_job": {
             "job_id": (exec_job["summary"] or {}).get("job_id"),

@@ -175,7 +175,7 @@ def _nft_snapshot() -> Dict[str, Any]:
     }
 
 
-def _load_decisions(job_dir: Path, limit: int = 300) -> List[Dict[str, Any]]:
+def _load_decisions(job_dir: Path, limit: int = 0) -> List[Dict[str, Any]]:
     path = job_dir / "llm_decisions.jsonl"
     if not path.exists():
         return []
@@ -191,9 +191,11 @@ def _distribution(decisions: List[Dict[str, Any]], getter) -> Dict[str, int]:
     return counter
 
 
-def _build_timeline(decisions: List[Dict[str, Any]], limit: int = 100) -> List[Dict[str, Any]]:
+def _build_timeline(decisions: List[Dict[str, Any]], limit: int = 0) -> List[Dict[str, Any]]:
+    visible = decisions[-limit:] if limit > 0 else decisions
+    start_index = max(1, len(decisions) - len(visible) + 1)
     items = []
-    for index, decision in enumerate(decisions[-limit:], start=max(1, len(decisions) - min(len(decisions), limit) + 1)):
+    for index, decision in enumerate(visible, start=start_index):
         tool = decision.get("tool_result") or {}
         items.append(
             {
