@@ -177,6 +177,55 @@ class ChannelEvalTests(unittest.TestCase):
             self.assertEqual(execution_eval["decision_state_distribution"]["unknown"], 1)
             self.assertEqual(execution_eval["ttl_reason_distribution"]["policy"], 1)
             self.assertEqual(execution_eval["ttl_reason_distribution"]["unknown"], 1)
+            self.assertEqual(execution_eval["decision_to_execution_consistency"], 1.0)
+
+    def test_execution_consistency_uses_paper_formula(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            job_dir = Path(tmpdir)
+            (job_dir / "channel_summary.json").write_text(
+                json.dumps(
+                    {
+                        "channel": "offline",
+                        "job_id": "job-3",
+                        "source_path": "dummy.pcap",
+                        "aggregation": {
+                            "surviving_windows": 3,
+                            "selected_windows": 3,
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            decisions = [
+                {
+                    "action": "block",
+                    "strategy": {"execution_mode": "drop"},
+                    "tool_result": {"ok": False, "action": "block_ip", "error": "boom"},
+                },
+                {
+                    "action": "block",
+                    "strategy": {"execution_mode": "none"},
+                },
+                {
+                    "action": "monitor",
+                    "strategy": {"execution_mode": "watch"},
+                    "tool_result": {"ok": True, "action": "watch_ip", "ip": "10.0.0.3"},
+                },
+            ]
+            (job_dir / "llm_decisions.jsonl").write_text(
+                "\n".join(json.dumps(item, ensure_ascii=False) for item in decisions) + "\n",
+                encoding="utf-8",
+            )
+            (job_dir / "llm_inputs_selected.jsonl").write_text("", encoding="utf-8")
+            (job_dir / "llm_inputs_all.jsonl").write_text("", encoding="utf-8")
+
+            report = evaluate_job(job_dir)
+            execution_eval = report["execution_eval"]
+
+            self.assertEqual(execution_eval["tool_success_count"], 1)
+            self.assertEqual(execution_eval["tool_failure_count"], 1)
+            self.assertEqual(execution_eval["decision_to_execution_consistency"], 0.666667)
 
 
 if __name__ == "__main__":

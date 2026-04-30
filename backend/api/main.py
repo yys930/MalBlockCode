@@ -29,7 +29,6 @@ JOBS_ROOT = BACKEND_ROOT / "jobs"
 PYTHON_BIN = BACKEND_ROOT / "MBvenv" / "bin" / "python"
 RUNNER_SCRIPT = BACKEND_ROOT / "scripts" / "run_channel.py"
 EVAL_SCRIPT = BACKEND_ROOT / "scripts" / "evaluate_channel.py"
-REPLAY_COMPARE_SCRIPT = BACKEND_ROOT / "scripts" / "evaluate_replay_comparison.py"
 NFT_TABLE = os.environ.get("NFT_TABLE", "inet")
 NFT_FAMILY_TABLE = os.environ.get("NFT_FAMILY_TABLE", "filter")
 NFT_BLOCK_SET = os.environ.get("NFT_SET", "blocklist_v4")
@@ -62,10 +61,6 @@ class RunRequest(BaseModel):
     capture_wait_sec: int = 2
     suricata_ready_timeout_sec: int = DEFAULT_SURICATA_READY_TIMEOUT_SEC
 
-
-class ReplayComparisonRequest(BaseModel):
-    exec_job_dir: str
-    baseline_job_dir: str
 
 
 @dataclass
@@ -433,38 +428,6 @@ async def evaluate_job(job_id: str) -> Dict[str, Any]:
     if proc.returncode != 0:
         raise HTTPException(status_code=500, detail=stderr.decode("utf-8", errors="ignore"))
     return {"ok": True, "job": _job_snapshot(job_dir), "stdout": stdout.decode("utf-8", errors="ignore")}
-
-
-@app.post("/api/replay/compare")
-async def compare_replay_jobs(payload: ReplayComparisonRequest) -> Dict[str, Any]:
-    proc = await asyncio.create_subprocess_exec(
-        str(PYTHON_BIN),
-        str(REPLAY_COMPARE_SCRIPT),
-        "--exec-job-dir",
-        payload.exec_job_dir,
-        "--baseline-job-dir",
-        payload.baseline_job_dir,
-        cwd=str(PROJECT_ROOT),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        env=os.environ.copy(),
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
-        detail = stderr.decode("utf-8", errors="ignore").strip() or stdout.decode("utf-8", errors="ignore").strip() or "replay comparison failed"
-        raise HTTPException(status_code=500, detail=detail)
-
-    try:
-        report = json.loads(stdout.decode("utf-8", errors="ignore"))
-    except json.JSONDecodeError as exc:
-        raise HTTPException(status_code=500, detail=f"failed to parse comparison report: {exc}") from exc
-
-    return {
-        "ok": True,
-        "report": report,
-        "exec_job": report.get("exec_job") or {},
-        "baseline_job": report.get("baseline_job") or {},
-    }
 
 
 @app.get("/api/runs")

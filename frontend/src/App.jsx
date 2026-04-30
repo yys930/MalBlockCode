@@ -20,7 +20,7 @@ const channelMeta = {
     finalTitle: "离线实验最终结果",
     finalNote: "汇总离线通道实验结束后的关键指标、策略分布与执行成效，作为最终实验结果展示。",
     evalTitle: "离线实验评估结果",
-    evalNote: "展示离线通道的结构化评估摘要，包括数据覆盖、决策有效性、执行有效性、收益观察与关键风险样本。",
+    evalNote: "展示离线通道的执行有效性、分布概览与关键风险样本。",
     objectiveTitle: "实验目的",
     objectiveText: "复现离线 PCAP 样本在检测、聚合、LLM 决策与执行层上的完整闭环，适合做策略回溯和结果复盘。",
     recommendedTitle: "推荐参数",
@@ -43,7 +43,7 @@ const channelMeta = {
     finalTitle: "在线实验最终结果",
     finalNote: "汇总在线通道实验完成后的结果分布、关键指标与阻断表现，用于联机实验总结。",
     evalTitle: "在线实验评估结果",
-    evalNote: "展示在线通道的压制效果、执行表现和关键风险样本，更适合用于系统联机验证。",
+    evalNote: "展示在线通道的执行有效性、分布概览与关键风险样本，更适合用于系统联机验证。",
     objectiveTitle: "实验目的",
     objectiveText: "验证在线回放场景下检测链路、LLM 决策链路与 nft 执行链路的协同稳定性，适合做联机演示。",
     recommendedTitle: "推荐参数",
@@ -112,11 +112,6 @@ const defaultForms = {
   },
 };
 
-const defaultReplayComparisonForm = {
-  exec_job_dir: "",
-  baseline_job_dir: "",
-};
-
 function formatNumber(value) {
   if (value === null || value === undefined || value === "") return "-";
   if (typeof value === "string" && Number.isNaN(Number(value))) return value;
@@ -132,7 +127,9 @@ function formatDecimal(value) {
 
 function formatRatio(value) {
   if (value === null || value === undefined || value === "") return "-";
-  return `${(Number(value) * 100).toFixed(1)}%`;
+  const parsed = Number(value);
+  if (Number.isNaN(parsed)) return String(value);
+  return `${(parsed * 100).toFixed(1)}%`;
 }
 
 function formatDateTime(value) {
@@ -749,7 +746,6 @@ function FinalSummary({ meta, job }) {
   const evaluation = job?.evaluation || {};
   const executionEval = evaluation.execution_eval || {};
   const strongMetrics = getStrongMetrics(evaluation);
-  const effectEval = evaluation.effect_eval || {};
   const datasetSummary = evaluation.dataset_summary || {};
   const distributions = job?.distributions || {};
 
@@ -763,7 +759,6 @@ function FinalSummary({ meta, job }) {
     ["强处置 F1", formatDecimal(strongMetrics.f1)],
     ["唯一阻断 IP", executionEval.unique_blocked_ip_count],
     ["执行一致性", formatRatio(executionEval.decision_to_execution_consistency)],
-    ["平均压制率", formatRatio(effectEval.mean_suppression_ratio)],
   ];
 
   return (
@@ -813,14 +808,9 @@ function FinalSummary({ meta, job }) {
   );
 }
 
-function EvaluationPanel({ meta, job, onEvaluate }) {
+function EvaluationPanel({ meta, job, channel, onEvaluate }) {
   const evaluation = job?.evaluation || {};
-  const datasetSummary = evaluation.dataset_summary || {};
-  const decisionEval = evaluation.decision_eval || {};
-  const riskMetrics = getRiskMetrics(evaluation);
-  const strongMetrics = getStrongMetrics(evaluation);
   const executionEval = evaluation.execution_eval || {};
-  const effectEval = evaluation.effect_eval || {};
 
   const riskCases = [
     ...(evaluation.error_analysis?.false_positive_cases || []),
@@ -844,28 +834,32 @@ function EvaluationPanel({ meta, job, onEvaluate }) {
       <div className="panel-note">{meta.evalNote}</div>
       {job ? (
         <div className="evaluation-stack">
-          <section className="evaluation-block">
-            <h3>数据覆盖</h3>
-            <div className="metric-mini-grid">
-              <div><span>输入行数</span><strong>{formatNumber(datasetSummary.input_rows)}</strong></div>
-              <div><span>采样行数</span><strong>{formatNumber(datasetSummary.selected_rows)}</strong></div>
-              <div><span>唯一源 IP</span><strong>{formatNumber(datasetSummary.unique_src_ip_count)}</strong></div>
-              <div><span>唯一 Flow UID</span><strong>{formatNumber(datasetSummary.unique_flow_uid_count)}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>决策有效性</h3>
-            <div className="metric-mini-grid">
-              <div><span>决策总量</span><strong>{formatNumber(decisionEval.decision_count || job?.decision_count)}</strong></div>
-              <div><span>风险识别 Precision</span><strong>{formatDecimal(riskMetrics.precision)}</strong></div>
-              <div><span>风险识别 Recall</span><strong>{formatDecimal(riskMetrics.recall)}</strong></div>
-              <div><span>风险识别 F1</span><strong>{formatDecimal(riskMetrics.f1)}</strong></div>
-              <div><span>强处置 Precision</span><strong>{formatDecimal(strongMetrics.precision)}</strong></div>
-              <div><span>强处置 Recall</span><strong>{formatDecimal(strongMetrics.recall)}</strong></div>
-              <div><span>强处置 F1</span><strong>{formatDecimal(strongMetrics.f1)}</strong></div>
-              <div><span>匹配决策数</span><strong>{formatNumber(firstDefined(strongMetrics.matched_decisions, decisionEval.csv_metrics?.matched_decisions))}</strong></div>
-            </div>
-          </section>
+          {channel === "csv" ? (
+            <>
+              <section className="evaluation-block">
+                <h3>数据覆盖</h3>
+                <div className="metric-mini-grid">
+                  <div><span>输入行数</span><strong>{formatNumber(evaluation.dataset_summary?.input_rows)}</strong></div>
+                  <div><span>采样行数</span><strong>{formatNumber(evaluation.dataset_summary?.selected_rows)}</strong></div>
+                  <div><span>唯一源 IP</span><strong>{formatNumber(evaluation.dataset_summary?.unique_src_ip_count)}</strong></div>
+                  <div><span>唯一 Flow UID</span><strong>{formatNumber(evaluation.dataset_summary?.unique_flow_uid_count)}</strong></div>
+                </div>
+              </section>
+              <section className="evaluation-block">
+                <h3>决策有效性</h3>
+                <div className="metric-mini-grid">
+                  <div><span>决策总量</span><strong>{formatNumber(evaluation.decision_eval?.decision_count || job?.decision_count)}</strong></div>
+                  <div><span>风险识别 Precision</span><strong>{formatDecimal(getRiskMetrics(evaluation).precision)}</strong></div>
+                  <div><span>风险识别 Recall</span><strong>{formatDecimal(getRiskMetrics(evaluation).recall)}</strong></div>
+                  <div><span>风险识别 F1</span><strong>{formatDecimal(getRiskMetrics(evaluation).f1)}</strong></div>
+                  <div><span>强处置 Precision</span><strong>{formatDecimal(getStrongMetrics(evaluation).precision)}</strong></div>
+                  <div><span>强处置 Recall</span><strong>{formatDecimal(getStrongMetrics(evaluation).recall)}</strong></div>
+                  <div><span>强处置 F1</span><strong>{formatDecimal(getStrongMetrics(evaluation).f1)}</strong></div>
+                  <div><span>匹配决策数</span><strong>{formatNumber(firstDefined(getStrongMetrics(evaluation).matched_decisions, evaluation.decision_eval?.csv_metrics?.matched_decisions))}</strong></div>
+                </div>
+              </section>
+            </>
+          ) : null}
           <section className="evaluation-block">
             <h3>执行有效性</h3>
             <div className="metric-mini-grid">
@@ -876,21 +870,8 @@ function EvaluationPanel({ meta, job, onEvaluate }) {
               <div><span>重复处置占比</span><strong>{formatRatio(executionEval.repeat_enforcement_ratio)}</strong></div>
               <div><span>短路次数</span><strong>{formatNumber(executionEval.skipped_execution_count)}</strong></div>
               <div><span>已覆盖比例</span><strong>{formatRatio(executionEval.covered_by_existing_action_ratio)}</strong></div>
-              <div><span>决策-执行一致性</span><strong>{formatRatio(executionEval.decision_to_execution_consistency)}</strong></div>
+              <div><span>执行一致性</span><strong>{formatRatio(executionEval.decision_to_execution_consistency)}</strong></div>
             </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>收益观察</h3>
-            <div className="metric-mini-grid">
-              <div><span>指标语义</span><strong>{effectEval.metric_semantics === "proxy" ? "代理指标" : "-"}</strong></div>
-              <div><span>代理指标名</span><strong>{effectEval.proxy_metric_name || "-"}</strong></div>
-              <div><span>评估决策数</span><strong>{formatNumber(effectEval.evaluated_decisions)}</strong></div>
-              <div><span>平均压制率</span><strong>{formatRatio(effectEval.mean_suppression_ratio)}</strong></div>
-            </div>
-            {effectEval.reason ? <div className="empty-state compact">{effectEval.reason}</div> : null}
-            {!effectEval.reason && effectEval.metric_semantics === "proxy" ? (
-              <div className="empty-state compact">该数值表示后续窗口风险下降的代理指标，不作为严格因果阻断收益结论。</div>
-            ) : null}
           </section>
           <section className="evaluation-block">
             <h3>分布概览</h3>
@@ -921,101 +902,6 @@ function EvaluationPanel({ meta, job, onEvaluate }) {
   );
 }
 
-function ReplayComparisonPanel({ form, updateForm, onCompare, loading, error, report }) {
-  const compatibility = report?.compatibility || {};
-  const matching = report?.matching || {};
-  const summaryDelta = report?.summary_delta || {};
-  const pairOutcomes = report?.pair_outcomes || {};
-  const executionImpact = report?.execution_impact || {};
-  const suppression = report?.suppression_comparison || {};
-  const alertVolume = report?.alert_volume_comparison || {};
-  const samples = report?.samples || {};
-
-  return (
-    <section className="card evaluation-card">
-      <div className="section-head">
-        <div>
-          <p className="section-kicker">Replay Comparison</p>
-          <h2>执行 / 无执行 对照评估</h2>
-        </div>
-        <button className="primary-btn" onClick={onCompare} disabled={loading}>
-          {loading ? "评估中..." : "开始对照评估"}
-        </button>
-      </div>
-      <div className="panel-note">独立比较两组已完成的在线回放实验结果，一组为真实执行阻断，另一组为 DRY_RUN 无执行基线。</div>
-      <div className="form-block">
-        <div className="field-grid two-col">
-          <label>
-            <span>执行组结果路径</span>
-            <input value={form.exec_job_dir} onChange={(e) => updateForm("exec_job_dir", e.target.value)} placeholder="/path/to/exec_job_dir" />
-          </label>
-          <label>
-            <span>无执行对照组路径</span>
-            <input value={form.baseline_job_dir} onChange={(e) => updateForm("baseline_job_dir", e.target.value)} placeholder="/path/to/baseline_job_dir" />
-          </label>
-        </div>
-      </div>
-      {error ? <div className="risk-card">{error}</div> : null}
-      {report ? (
-        <div className="evaluation-stack">
-          {!compatibility.compatible ? (
-            <div className="risk-card">兼容性检查未完全通过：{(compatibility.differences || []).join("；") || "存在配置差异"}</div>
-          ) : null}
-          <section className="evaluation-block">
-            <h3>对照概览</h3>
-            <div className="metric-mini-grid">
-              <div><span>执行组 Job</span><strong>{report?.exec_job?.job_id || "-"}</strong></div>
-              <div><span>对照组 Job</span><strong>{report?.baseline_job?.job_id || "-"}</strong></div>
-              <div><span>匹配决策数</span><strong>{formatNumber(matching.matched_pairs)}</strong></div>
-              <div><span>执行组匹配率</span><strong>{formatRatio(matching.match_rate_exec)}</strong></div>
-              <div><span>对照组匹配率</span><strong>{formatRatio(matching.match_rate_baseline)}</strong></div>
-              <div><span>兼容性</span><strong>{compatibility.compatible ? "通过" : "存在差异"}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>核心差值</h3>
-            <div className="metric-mini-grid">
-              <div><span>平均压制率差值</span><strong>{formatRatio(suppression.delta_mean_suppression_ratio)}</strong></div>
-              <div><span>过滤告警差值</span><strong>{formatNumber(alertVolume.delta_filtered_alerts)}</strong></div>
-              <div><span>过滤告警变化率</span><strong>{formatRatio(alertVolume.delta_filtered_alert_ratio)}</strong></div>
-              <div><span>工具成功数差值</span><strong>{formatNumber(summaryDelta.tool_success_count_delta)}</strong></div>
-              <div><span>有效执行差值</span><strong>{formatNumber(firstDefined(summaryDelta.effective_enforcement_count_delta, summaryDelta.new_enforcement_count_delta))}</strong></div>
-              <div><span>唯一阻断 IP 差值</span><strong>{formatNumber(summaryDelta.unique_blocked_ip_count_delta)}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>动作与执行对比</h3>
-            <div className="metric-mini-grid">
-              <div><span>同动作同模式</span><strong>{formatNumber(pairOutcomes.same_action_same_mode)}</strong></div>
-              <div><span>同动作异模式</span><strong>{formatNumber(pairOutcomes.same_action_different_mode)}</strong></div>
-              <div><span>不同动作</span><strong>{formatNumber(pairOutcomes.different_action)}</strong></div>
-              <div><span>执行组更强</span><strong>{formatNumber(pairOutcomes.exec_stronger_than_baseline)}</strong></div>
-              <div><span>对照组更强</span><strong>{formatNumber(pairOutcomes.baseline_stronger_than_exec)}</strong></div>
-              <div><span>仅执行层差异对</span><strong>{formatNumber(executionImpact.pairs_with_execution_only_effect)}</strong></div>
-            </div>
-          </section>
-          <section className="evaluation-block">
-            <h3>典型样本</h3>
-            <div className="risk-list">
-              {(samples.different_action_cases || []).slice(0, 5).map((item, index) => (
-                <div className="risk-card" key={`diff-${index}`}>{JSON.stringify(item)}</div>
-              ))}
-              {(samples.suppression_improvement_cases || []).slice(0, 5).map((item, index) => (
-                <div className="risk-card" key={`supp-${index}`}>{JSON.stringify(item)}</div>
-              ))}
-              {!((samples.different_action_cases || []).length || (samples.suppression_improvement_cases || []).length) ? (
-                <div className="empty-state compact">暂无可展示样本。</div>
-              ) : null}
-            </div>
-          </section>
-        </div>
-      ) : (
-        <div className="empty-state">请输入两组 replay 结果路径后开始评估。</div>
-      )}
-    </section>
-  );
-}
-
 function ChannelPage({
   channel,
   onBack,
@@ -1033,12 +919,6 @@ function ChannelPage({
   nftStatus,
   nftStatusError,
   onRefreshNft,
-  replayComparisonForm,
-  onUpdateReplayComparisonForm,
-  onCompareReplay,
-  replayComparisonLoading,
-  replayComparisonError,
-  replayComparisonReport,
 }) {
   const meta = channelMeta[channel];
   const visibleJob = jobMatchesChannel(selectedJob, channel) ? selectedJob : null;
@@ -1089,18 +969,8 @@ function ChannelPage({
           <DecisionTimeline title={meta.decisionTitle} note={meta.decisionNote} items={timeline} />
           <ExecutionTimeline title={meta.executionTitle} note={meta.executionNote} items={timeline} />
           <NftStatusPanel data={nftStatus} error={nftStatusError} onRefresh={onRefreshNft} />
-          <FinalSummary meta={meta} job={visibleJob} />
-          <EvaluationPanel meta={meta} job={visibleJob} onEvaluate={onEvaluate} />
-          {channel === "replay" ? (
-            <ReplayComparisonPanel
-              form={replayComparisonForm}
-              updateForm={onUpdateReplayComparisonForm}
-              onCompare={onCompareReplay}
-              loading={replayComparisonLoading}
-              error={replayComparisonError}
-              report={replayComparisonReport}
-            />
-          ) : null}
+          {channel !== "offline" ? <FinalSummary meta={meta} job={visibleJob} /> : null}
+          <EvaluationPanel meta={meta} job={visibleJob} channel={channel} onEvaluate={onEvaluate} />
         </div>
       </main>
     </div>
@@ -1117,10 +987,6 @@ function App() {
   const [latestRun, setLatestRun] = useState(null);
   const [nftStatus, setNftStatus] = useState(null);
   const [nftStatusError, setNftStatusError] = useState("");
-  const [replayComparisonForm, setReplayComparisonForm] = useState(defaultReplayComparisonForm);
-  const [replayComparisonLoading, setReplayComparisonLoading] = useState(false);
-  const [replayComparisonError, setReplayComparisonError] = useState("");
-  const [replayComparisonReport, setReplayComparisonReport] = useState(null);
   const [loading, setLoading] = useState(true);
 
   async function api(path, options) {
@@ -1248,13 +1114,6 @@ function App() {
     }));
   }
 
-  function updateReplayComparisonForm(field, value) {
-    setReplayComparisonForm((prev) => ({
-      ...prev,
-      [field]: value,
-    }));
-  }
-
   async function startRun() {
     if (!activeChannel) return;
     const current = forms[activeChannel];
@@ -1286,24 +1145,6 @@ function App() {
     await loadJobs(selectedJobId);
   }
 
-  async function compareReplay() {
-    setReplayComparisonLoading(true);
-    setReplayComparisonError("");
-    try {
-      const payload = await api("/replay/compare", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(replayComparisonForm),
-      });
-      setReplayComparisonReport(payload.report || null);
-    } catch (error) {
-      setReplayComparisonReport(null);
-      setReplayComparisonError(error.message || "对照评估失败");
-    } finally {
-      setReplayComparisonLoading(false);
-    }
-  }
-
   return (
     <div className="app-shell">
       {page === "home" ? (
@@ -1326,12 +1167,6 @@ function App() {
           nftStatus={nftStatus}
           nftStatusError={nftStatusError}
           onRefreshNft={loadNftStatus}
-          replayComparisonForm={replayComparisonForm}
-          onUpdateReplayComparisonForm={updateReplayComparisonForm}
-          onCompareReplay={compareReplay}
-          replayComparisonLoading={replayComparisonLoading}
-          replayComparisonError={replayComparisonError}
-          replayComparisonReport={replayComparisonReport}
         />
       )}
       {loading ? <div className="loading-mask">Loading…</div> : null}

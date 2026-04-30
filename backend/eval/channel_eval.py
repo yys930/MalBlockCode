@@ -38,7 +38,6 @@ NOISE_SIGNATURE_KEYWORDS = (
     "request line incomplete",
     "gzip decompression failed",
 )
-PROXY_METRIC_NAME = "subsequent_window_risk_reduction_proxy"
 EXPERT_RULE_VERSION = "v2.0-thesis"
 RISK_TIER_CRITERIA = {
     "high": "severity_min <= 2, hits >= 20, or repeat-offender style recurrence",
@@ -208,6 +207,14 @@ def _metric_ratio(numerator: int, denominator: int) -> float | None:
     if denominator <= 0:
         return None
     return round(numerator / denominator, 6)
+
+
+def _is_execution_consistency_numerator_mode(execution_mode: str) -> bool:
+    return execution_mode in {"drop", "rate_limit", "watch"}
+
+
+def _is_execution_consistency_denominator_action(action: str) -> bool:
+    return action in {"block", "monitor"}
 
 
 def _compute_prf(tp: int, fp: int, fn: int) -> Dict[str, float | None]:
@@ -382,8 +389,8 @@ def _build_execution_eval_report(
     failure_count: int,
     new_enforcement_count: int,
     repeat_enforcement_count: int,
-    consistency_count: int,
-    consistency_total: int,
+    execution_consistency_numerator: int,
+    execution_consistency_denominator: int,
     decision_state_counter: Counter,
     ttl_reason_counter: Counter,
     decision_count: int,
@@ -404,7 +411,10 @@ def _build_execution_eval_report(
         "effective_enforcement_count": new_enforcement_count,
         "new_enforcement_count": new_enforcement_count,
         "repeat_enforcement_count": repeat_enforcement_count,
-        "decision_to_execution_consistency": _metric_ratio(consistency_count, consistency_total),
+        "decision_to_execution_consistency": _metric_ratio(
+            execution_consistency_numerator,
+            execution_consistency_denominator,
+        ),
         "decision_state_distribution": _distribution_with_unknown(decision_state_counter, decision_count),
         "ttl_reason_distribution": _distribution_with_unknown(ttl_reason_counter, decision_count),
         "already_present_count": already_present_count,
@@ -600,8 +610,8 @@ def _evaluate_csv_job_streaming(job_dir: Path, summary: Dict[str, Any]) -> Dict[
     covered_by_existing_action_count = 0
     new_enforcement_count = 0
     repeat_enforcement_count = 0
-    consistency_count = 0
-    consistency_total = 0
+    execution_consistency_numerator = 0
+    execution_consistency_denominator = 0
     unique_blocked_ips = set()
     unique_rate_limited_ips = set()
     unique_watched_ips = set()
@@ -643,11 +653,10 @@ def _evaluate_csv_job_streaming(job_dir: Path, summary: Dict[str, Any]) -> Dict[
         if ttl_reason:
             ttl_reason_counter[ttl_reason] += 1
 
-        expected_tool = _expected_tool_name(action, execution_mode)
-        if expected_tool is not None or tool_result:
-            consistency_total += 1
-            if _decision_execution_consistent(decision):
-                consistency_count += 1
+        if _is_execution_consistency_denominator_action(action):
+            execution_consistency_denominator += 1
+            if _is_execution_consistency_numerator_mode(execution_mode):
+                execution_consistency_numerator += 1
 
         if ok:
             success_count += 1
@@ -790,8 +799,8 @@ def _evaluate_csv_job_streaming(job_dir: Path, summary: Dict[str, Any]) -> Dict[
             failure_count=failure_count,
             new_enforcement_count=new_enforcement_count,
             repeat_enforcement_count=repeat_enforcement_count,
-            consistency_count=consistency_count,
-            consistency_total=consistency_total,
+            execution_consistency_numerator=execution_consistency_numerator,
+            execution_consistency_denominator=execution_consistency_denominator,
             decision_state_counter=decision_state_counter,
             ttl_reason_counter=ttl_reason_counter,
             decision_count=decision_count,
@@ -813,37 +822,8 @@ def _evaluate_csv_job_streaming(job_dir: Path, summary: Dict[str, Any]) -> Dict[
         "samples": {
             "decision_samples": sample_rows[:20],
         },
-        "effect_eval": {
-            "applicable": False,
-            "metric_semantics": "proxy",
-            "proxy_metric_name": PROXY_METRIC_NAME,
-            "reason": "csv_flow is a structured-flow decision evaluation channel, not a live or replay mitigation-effect channel.",
-        },
     }
     return report
-
-
-def _expected_tool_name(action: str, execution_mode: str) -> str | None:
-    if action == "block" and execution_mode == "drop":
-        return "block_ip"
-    if action == "block" and execution_mode == "rate_limit":
-        return "rate_limit_ip"
-    if action == "monitor" and execution_mode == "watch":
-        return "watch_ip"
-    return None
-
-
-def _decision_execution_consistent(decision: Dict[str, Any]) -> bool:
-    action = str(decision.get("action") or "")
-    strategy = decision.get("strategy") or {}
-    execution_mode = str(strategy.get("execution_mode") or "none")
-    expected_tool = _expected_tool_name(action, execution_mode)
-    tool_result = decision.get("tool_result") or {}
-    actual_tool = str(tool_result.get("action") or "")
-
-    if expected_tool is None:
-        return not tool_result or not actual_tool
-    return bool(tool_result.get("ok")) and actual_tool == expected_tool
 
 
 def _collect_execution_eval(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -854,8 +834,8 @@ def _collect_execution_eval(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
     covered_by_existing_action_count = 0
     new_enforcement_count = 0
     repeat_enforcement_count = 0
-    consistency_count = 0
-    consistency_total = 0
+    execution_consistency_numerator = 0
+    execution_consistency_denominator = 0
     unique_blocked_ips = set()
     unique_rate_limited_ips = set()
     unique_watched_ips = set()
@@ -879,14 +859,12 @@ def _collect_execution_eval(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
         if ttl_reason:
             ttl_reason_counter[ttl_reason] += 1
 
-        expected_tool = _expected_tool_name(
-            str(decision.get("action") or ""),
-            str((decision.get("strategy") or {}).get("execution_mode") or "none"),
-        )
-        if expected_tool is not None or tool_result:
-            consistency_total += 1
-            if _decision_execution_consistent(decision):
-                consistency_count += 1
+        high_level_action = str(decision.get("action") or "")
+        execution_mode = str((decision.get("strategy") or {}).get("execution_mode") or "none")
+        if _is_execution_consistency_denominator_action(high_level_action):
+            execution_consistency_denominator += 1
+            if _is_execution_consistency_numerator_mode(execution_mode):
+                execution_consistency_numerator += 1
 
         if ok:
             success_count += 1
@@ -929,8 +907,8 @@ def _collect_execution_eval(decisions: List[Dict[str, Any]]) -> Dict[str, Any]:
         failure_count=failure_count,
         new_enforcement_count=new_enforcement_count,
         repeat_enforcement_count=repeat_enforcement_count,
-        consistency_count=consistency_count,
-        consistency_total=consistency_total,
+        execution_consistency_numerator=execution_consistency_numerator,
+        execution_consistency_denominator=execution_consistency_denominator,
         decision_state_counter=decision_state_counter,
         ttl_reason_counter=ttl_reason_counter,
         decision_count=len(decisions),
@@ -1241,100 +1219,6 @@ REPLAY_NOISE_SIGNATURE_KEYWORDS = (
 )
 
 
-def _window_noise_hit_breakdown(window: Dict[str, Any]) -> Dict[str, int]:
-    total_hits = _safe_int(window.get("hits"), 0)
-    noise_hits = 0
-    for item in _top_signatures_from_evidence(window):
-        signature = str(item.get("signature") or "").lower()
-        if any(keyword in signature for keyword in REPLAY_NOISE_SIGNATURE_KEYWORDS):
-            noise_hits += _safe_int(item.get("count"), 0)
-    noise_hits = min(noise_hits, total_hits)
-    return {
-        "total_hits": total_hits,
-        "noise_hits": noise_hits,
-        "effective_hits": max(0, total_hits - noise_hits),
-    }
-
-
-def _evaluate_alert_suppression_proxy(decisions: List[Dict[str, Any]], aggregated_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
-    windows_by_src: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-    for item in aggregated_inputs:
-        windows_by_src[str(item.get("src_ip") or "")].append(item)
-    for src_ip in windows_by_src:
-        windows_by_src[src_ip].sort(key=lambda x: int(x.get("window_start_epoch") or 0))
-
-    per_decision = []
-    ratios: List[float] = []
-    excluded_noise_cases = 0
-    excluded_noise_hit_count = 0
-    for decision in decisions:
-        strategy = decision.get("strategy") or {}
-        execution_mode = str(strategy.get("execution_mode") or "")
-        if execution_mode not in {"drop", "rate_limit"}:
-            continue
-        evidence = decision.get("evidence") or {}
-        src_ip = str((decision.get("target") or {}).get("value") or evidence.get("src_ip") or "")
-        start_iso = evidence.get("window_start_iso")
-        ttl_sec = _safe_int(decision.get("ttl_sec"), 0)
-        windows = windows_by_src.get(src_ip, [])
-        decision_start = None
-        decision_window = None
-        for window in windows:
-            if window.get("window_start_iso") == start_iso:
-                decision_start = _safe_int(window.get("window_start_epoch"), 0)
-                decision_window = window
-                break
-        if decision_start is None or decision_window is None:
-            continue
-
-        before_breakdown = _window_noise_hit_breakdown(decision_window)
-        before_hits_raw = before_breakdown["total_hits"]
-        before_hits = before_breakdown["effective_hits"]
-        excluded_noise_hit_count += before_breakdown["noise_hits"]
-        if before_hits <= 0:
-            excluded_noise_cases += 1
-            continue
-
-        after_hits_raw = 0
-        after_hits = 0
-        cutoff = decision_start + max(1, ttl_sec)
-        for window in windows:
-            start_epoch = _safe_int(window.get("window_start_epoch"), 0)
-            if decision_start < start_epoch <= cutoff:
-                after_breakdown = _window_noise_hit_breakdown(window)
-                after_hits_raw += after_breakdown["total_hits"]
-                after_hits += after_breakdown["effective_hits"]
-                excluded_noise_hit_count += after_breakdown["noise_hits"]
-        ratio = round(max(0.0, 1.0 - (after_hits / before_hits)), 6)
-        ratios.append(ratio)
-        per_decision.append(
-            {
-                "src_ip": src_ip,
-                "decision_window_start_iso": start_iso,
-                "execution_mode": execution_mode,
-                "before_hits": before_hits,
-                "before_hits_raw": before_hits_raw,
-                "after_hits_within_ttl": after_hits,
-                "after_hits_within_ttl_raw": after_hits_raw,
-                "excluded_noise_hits": before_breakdown["noise_hits"] + max(0, after_hits_raw - after_hits),
-                "suppression_ratio": ratio,
-            }
-        )
-
-    return {
-        "applicable": True,
-        "metric_semantics": "proxy",
-        "proxy_metric_name": PROXY_METRIC_NAME,
-        "noise_filtered": True,
-        "noise_signature_keywords": list(REPLAY_NOISE_SIGNATURE_KEYWORDS),
-        "excluded_noise_cases": excluded_noise_cases,
-        "excluded_noise_hit_count": excluded_noise_hit_count,
-        "evaluated_decisions": len(per_decision),
-        "mean_suppression_ratio": round(sum(ratios) / len(ratios), 6) if ratios else None,
-        "per_decision": per_decision[:100],
-    }
-
-
 def _evaluate_csv_channel(decisions: List[Dict[str, Any]], selected_inputs: List[Dict[str, Any]]) -> Dict[str, Any]:
     inputs_by_key: Dict[CSV_EVAL_KEY, List[Dict[str, Any]]] = defaultdict(list)
     for item in selected_inputs:
@@ -1617,13 +1501,9 @@ def evaluate_job(job_dir: str | Path) -> Dict[str, Any]:
             "execution_eval": _collect_execution_eval(decisions),
         }
 
-        all_inputs = list(iter_jsonl(str(job_dir / "llm_inputs_all.jsonl"))) if (job_dir / "llm_inputs_all.jsonl").exists() else selected_inputs
-        suppression_eval = _evaluate_alert_suppression_proxy(decisions, all_inputs)
-        report["effect_eval"] = suppression_eval
         report["error_analysis"] = {
             "tool_failed_cases": report["execution_eval"]["tool_failed_cases"],
         }
-        report["samples"] = {"suppression_samples": suppression_eval.get("per_decision", [])[:20]}
 
     out_path = job_dir / "evaluation_report.json"
     out_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
